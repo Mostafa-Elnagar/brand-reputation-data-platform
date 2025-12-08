@@ -1,0 +1,51 @@
+{
+  "Comment": "Ingest Reddit listings for multiple subreddits sequentially",
+  "StartAt": "GenerateInvocations",
+  "States": {
+    "GenerateInvocations": {
+      "Type": "Pass",
+      "Parameters": {
+        "invocations": ${invocations_json}
+      },
+      "Next": "ProcessSubreddits"
+    },
+    "ProcessSubreddits": {
+      "Type": "Map",
+      "ItemsPath": "$.invocations",
+      "MaxConcurrency": 1,
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "InvokeLambda",
+        "States": {
+          "InvokeLambda": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "${lambda_function_arn}",
+              "Payload": {
+                "subreddit.$": "$.subreddit",
+                "sort_type.$": "$.sort_type",
+                "time_filter": "all",
+                "max_items": 1000,
+                "include_comments": true
+              }
+            },
+            "Retry": [
+              {
+                "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException", "States.Timeout"],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "ResultPath": "$.lambdaResult",
+            "End": true
+          }
+        }
+      },
+      "End": true
+    }
+  }
+}
