@@ -25,11 +25,5 @@ variable "default_subreddit" {
 variable "max_submissions" {
   description = "Maximum number of submissions to ingest per run."
   type        = number
-  default     = 100
-}
-
-variable "reddit_ingestion_schedule_expression" {
-  description = "EventBridge schedule expression for Reddit ingestion."
-  type        = string
-  default     = "rate(1 hour)"
+  default     = 1000
 }

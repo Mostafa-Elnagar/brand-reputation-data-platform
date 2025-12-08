@@ -7,27 +7,23 @@ resource "aws_lambda_function" "reddit_ingestion" {
   filename         = var.reddit_ingestion_lambda_package
   source_code_hash = filebase64sha256(var.reddit_ingestion_lambda_package)
 
-  timeout      = 300
+  timeout      = 900
   memory_size  = 512
-  description  = "Fetch Reddit data and write JSONL files to the landing zone bucket."
+  description  = "Fetch Reddit listings (top/controversial) and write JSONL files to S3."
 
   environment {
     variables = {
-      LANDING_BUCKET_NAME   = local.landing_bucket_name
-      LANDING_BUCKET_PREFIX = local.reddit_prefix
-      REDDIT_SECRET_ARN     = var.reddit_secret_arn
-      DEFAULT_SUBREDDIT     = var.default_subreddit
-      MAX_SUBMISSIONS       = tostring(var.max_submissions)
-
-      ENVIRONMENT     = var.environment
-      STATE_BASE_PATH = "/reddit-ingest"
-      RUNS_TABLE_NAME = aws_dynamodb_table.reddit_ingestion_runs.name
-      METRICS_NAMESPACE = "RedditIngestion"
-      MAX_HOURLY_WINDOWS_PER_RUN = "1"
+      LANDING_BUCKET_NAME    = local.landing_bucket_name
+      LANDING_BUCKET_PREFIX  = local.reddit_prefix
+      REDDIT_SECRET_ARN      = var.reddit_secret_arn
+      DEFAULT_SUBREDDIT      = var.default_subreddit
+      MAX_SUBMISSIONS        = tostring(var.max_submissions)
+      ENVIRONMENT            = var.environment
+      RUNS_TABLE_NAME        = local.lambda_run_logs_table_name
+      CHECKPOINTS_TABLE_NAME = local.checkpoints_table_name
+      METRICS_NAMESPACE      = "RedditIngestion"
     }
   }
 
   tags = local.default_tags
 }
-
-

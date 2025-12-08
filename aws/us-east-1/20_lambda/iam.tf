@@ -53,19 +53,6 @@ data "aws_iam_policy_document" "reddit_ingestion_policy" {
   }
 
   statement {
-    sid = "AllowReadWriteIngestionState"
-
-    actions = [
-      "ssm:GetParameter",
-      "ssm:PutParameter",
-    ]
-
-    resources = [
-      "arn:aws:ssm:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:parameter/reddit-ingest/*",
-    ]
-  }
-
-  statement {
     sid = "AllowWriteIngestionRuns"
 
     actions = [
@@ -73,7 +60,22 @@ data "aws_iam_policy_document" "reddit_ingestion_policy" {
     ]
 
     resources = [
-      aws_dynamodb_table.reddit_ingestion_runs.arn,
+      local.lambda_run_logs_table_arn,
+    ]
+  }
+
+  statement {
+    sid = "AllowReadWriteIngestionCheckpoints"
+
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:Query",
+    ]
+
+    resources = [
+      local.checkpoints_table_arn,
     ]
   }
 
@@ -99,5 +101,3 @@ resource "aws_iam_role_policy_attachment" "reddit_ingestion_attach" {
   role       = aws_iam_role.reddit_ingestion_lambda.name
   policy_arn = aws_iam_policy.reddit_ingestion_inline.arn
 }
-
-
