@@ -1,15 +1,14 @@
-from __future__ import annotations
-
 """
 Run metadata and metrics recording for Reddit ingestion.
 
-This module is responsible for persisting per-window ingestion runs to
-Amazon DynamoDB and publishing summary metrics to Amazon CloudWatch.
+This module persists ingestion run metadata to DynamoDB and publishes
+summary metrics to CloudWatch.
 """
 
+from __future__ import annotations
+
 import logging
-import time
-from typing import Dict
+from typing import Any, Dict, List
 
 import boto3
 from botocore.exceptions import ClientError
@@ -44,13 +43,13 @@ class RedditIngestionRunRecorder:
         *,
         mode: str,
         subreddit: str,
+        run_timestamp: int,
     ) -> None:
         """
         Persist run metadata to DynamoDB and publish CloudWatch metrics.
         """
-        ingested_at_ts = int(time.time())
         pk = f"ENV#{self._environment}#SUBREDDIT#{subreddit}"
-        sk = f"RUN#{result.window_start_ts or ingested_at_ts}"
+        sk = f"RUN#{run_timestamp}#{result.sort_type}"
 
         self._put_run_item(
             pk=pk,
@@ -58,7 +57,7 @@ class RedditIngestionRunRecorder:
             result=result,
             mode=mode,
             subreddit=subreddit,
-            ingested_at_ts=ingested_at_ts,
+            ingested_at_ts=run_timestamp,
         )
         self._publish_metrics(result=result, subreddit=subreddit)
 
@@ -72,7 +71,7 @@ class RedditIngestionRunRecorder:
         subreddit: str,
         ingested_at_ts: int,
     ) -> None:
-        item: Dict[str, Dict[str, str]] = {
+        item: Dict[str, Dict[str, Any]] = {
             "pk": {"S": pk},
             "sk": {"S": sk},
             "Environment": {"S": self._environment},
@@ -81,12 +80,10 @@ class RedditIngestionRunRecorder:
             "SubmissionsCount": {"N": str(result.submissions_count)},
             "CommentsCount": {"N": str(result.comments_count)},
             "IngestedAtTs": {"N": str(ingested_at_ts)},
+            "SortType": {"S": result.sort_type},
+            "TimeFilter": {"S": result.time_filter},
+            "S3Prefix": {"S": result.s3_prefix},
         }
-
-        if result.window_start_ts:
-            item["WindowStartTs"] = {"N": str(result.window_start_ts)}
-        if result.window_end_ts:
-            item["WindowEndTs"] = {"N": str(result.window_end_ts)}
 
         try:
             self._dynamodb.put_item(
@@ -106,37 +103,36 @@ class RedditIngestionRunRecorder:
 
     def _publish_metrics(self, *, result: RedditIngestionResult, subreddit: str) -> None:
         try:
+            dimensions: List[Dict[str, str]] = [
+                {"Name": "Environment", "Value": self._environment},
+                {"Name": "Subreddit", "Value": subreddit},
+                {"Name": "SortType", "Value": result.sort_type},
+            ]
+
             self._cloudwatch.put_metric_data(
                 Namespace=self._cloudwatch_namespace,
                 MetricData=[
                     {
-                        "MetricName": "NewSubmissions",
-                        "Dimensions": [
-                            {"Name": "Environment", "Value": self._environment},
-                            {"Name": "Subreddit", "Value": subreddit},
-                        ],
+                        "MetricName": "SubmissionsFetched",
+                        "Dimensions": dimensions,
                         "Value": float(result.submissions_count),
                         "Unit": "Count",
                     },
                     {
-                        "MetricName": "NewComments",
-                        "Dimensions": [
-                            {"Name": "Environment", "Value": self._environment},
-                            {"Name": "Subreddit", "Value": subreddit},
-                        ],
+                        "MetricName": "CommentsFetched",
+                        "Dimensions": dimensions,
                         "Value": float(result.comments_count),
                         "Unit": "Count",
                     },
                 ],
             )
             LOGGER.info(
-                "Published metrics for subreddit=%s submissions=%d comments=%d",
+                "Published metrics for subreddit=%s sort_type=%s submissions=%d comments=%d",
                 subreddit,
+                result.sort_type,
                 result.submissions_count,
                 result.comments_count,
             )
         except ClientError as exc:
             LOGGER.error("Failed to publish ingestion metrics: %s", exc)
             raise
-
-

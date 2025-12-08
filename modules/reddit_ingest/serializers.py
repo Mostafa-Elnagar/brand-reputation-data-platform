@@ -38,15 +38,29 @@ class SubmissionSerializer:
     """Serialize a PRAW Submission into a JSON-safe dict."""
 
     @staticmethod
-    def to_dict(s: Any) -> Dict[str, Any]:
+    def to_dict(s: Any, *, updated_at: int) -> Dict[str, Any]:
+        """
+        Convert a Submission into a flat, JSON-serializable dictionary.
+
+        The `updated_at` argument should be the unix timestamp (UTC seconds)
+        at which this record was observed by the ingestion pipeline. This
+        allows downstream consumers to treat the output as an append-only
+        event stream while still supporting upsert semantics keyed by the
+        stable Reddit fullname identifier.
+        """
         subreddit_name = getattr(getattr(s, "subreddit", None), "display_name", None)
-        return {
-            "id": getattr(s, "id", None),
+        submission_id = getattr(s, "id", None)
+        fullname_id: Optional[str] = f"t3_{submission_id}" if submission_id else None
+
+        base: Dict[str, Any] = {
+            "id": submission_id,
+            "fullname_id": fullname_id,
             "subreddit": subreddit_name,
             "author": _safe_author_name(getattr(s, "author", None)),
             "title": getattr(s, "title", "") or "",
             "selftext": getattr(s, "selftext", "") or "",
             "created_utc": int(getattr(s, "created_utc", 0) or 0),
+            "updated_at": int(updated_at),
             "score": int(getattr(s, "score", 0) or 0),
             "upvote_ratio": float(getattr(s, "upvote_ratio", 0.0) or 0.0),
             "num_comments": int(getattr(s, "num_comments", 0) or 0),
@@ -64,12 +78,25 @@ class SubmissionSerializer:
             "thumbnail": getattr(s, "thumbnail", None),
         }
 
+        ingestion_metadata = getattr(s, "_ingestion_metadata", None)
+        if ingestion_metadata:
+            base["_ingestion_metadata"] = ingestion_metadata
+
+        return base
+
 
 class CommentSerializer:
     """Serialize a PRAW Comment into a JSON-safe dict."""
 
     @staticmethod
-    def to_dict(c: Any) -> Dict[str, Any]:
+    def to_dict(c: Any, *, updated_at: int) -> Dict[str, Any]:
+        """
+        Convert a Comment into a flat, JSON-serializable dictionary.
+
+        The `updated_at` argument should be the unix timestamp (UTC seconds)
+        at which this record was observed by the ingestion pipeline. Combined
+        with the stable fullname identifier this enables downstream upserts.
+        """
         link_id = getattr(c, "link_id", None)
         parent_id = getattr(c, "parent_id", None)
         submission_id: Optional[str] = None
@@ -78,14 +105,20 @@ class CommentSerializer:
         else:
             submission = getattr(c, "submission", None)
             submission_id = getattr(submission, "id", None)
+
+        comment_id = getattr(c, "id", None)
+        fullname_id: Optional[str] = f"t1_{comment_id}" if comment_id else None
+
         return {
-            "id": getattr(c, "id", None),
+            "id": comment_id,
+            "fullname_id": fullname_id,
             "submission_id": submission_id,
             "link_id": link_id,
             "parent_id": parent_id,
             "author": _safe_author_name(getattr(c, "author", None)),
             "body": getattr(c, "body", "") or "",
             "created_utc": int(getattr(c, "created_utc", 0) or 0),
+            "updated_at": int(updated_at),
             "score": int(getattr(c, "score", 0) or 0),
             "controversiality": int(getattr(c, "controversiality", 0) or 0),
             "is_submitter": bool(getattr(c, "is_submitter", False)),
