@@ -202,11 +202,13 @@ def main():
         'JOB_NAME',
         'LANDING_BUCKET',
         'DATABASE_NAME',
+        'AUGMENTED_BUCKET',
     ])
     
     job_name = args['JOB_NAME']
     landing_bucket = args['LANDING_BUCKET']
     database_name = args['DATABASE_NAME']
+    augmented_bucket = args['AUGMENTED_BUCKET']
     
     process_date = args.get('PROCESS_DATE')
     if not process_date:
@@ -223,7 +225,7 @@ def main():
     spark = SparkSession.builder \
         .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
         .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog") \
-        .config("spark.sql.catalog.glue_catalog.warehouse", f"s3://{landing_bucket.replace('-lz', '-augmented')}/bronze/") \
+        .config("spark.sql.catalog.glue_catalog.warehouse", f"s3://{augmented_bucket}/bronze/") \
         .config("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog") \
         .config("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO") \
         .config("spark.sql.iceberg.handle-timestamp-without-timezone", "true") \

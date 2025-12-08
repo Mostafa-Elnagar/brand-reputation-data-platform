@@ -344,6 +344,7 @@ resource "aws_glue_job" "reddit_bronze_ingestion" {
     "--TempDir"                          = "s3://${local.augmented_bucket_name}/glue/temp/"
     "--LANDING_BUCKET"                   = local.landing_bucket_name
     "--DATABASE_NAME"                    = aws_glue_catalog_database.bronze.name
+    "--AUGMENTED_BUCKET"                 = local.augmented_bucket_name
     "--datalake-formats"                 = "iceberg"
   }
 
