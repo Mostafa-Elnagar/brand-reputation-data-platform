@@ -183,6 +183,20 @@ data "aws_iam_policy_document" "glue_job_policy" {
 
     resources = ["*"]
   }
+
+  statement {
+    sid = "AllowWriteGlueMetricsToDynamoDB"
+
+    actions = [
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:BatchWriteItem",
+    ]
+
+    resources = [
+      local.glue_metrics_table_arn,
+    ]
+  }
 }
 
 resource "aws_iam_policy" "glue_job_policy" {

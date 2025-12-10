@@ -345,6 +345,9 @@ resource "aws_glue_job" "reddit_bronze_ingestion" {
     "--LANDING_BUCKET"                   = local.landing_bucket_name
     "--DATABASE_NAME"                    = aws_glue_catalog_database.bronze.name
     "--AUGMENTED_BUCKET"                 = local.augmented_bucket_name
+    "--METRICS_TABLE_NAME"               = local.glue_metrics_table_name
+    "--ENVIRONMENT"                      = var.environment
+    "--METRICS_NAMESPACE"                = "RedditBronzeIngestion"
     "--datalake-formats"                 = "iceberg"
   }
 
