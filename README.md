@@ -19,7 +19,8 @@ The current scope focuses on **Reddit ingestion into the landing and bronze laye
     - Augmented zone: (reserved for later processing stages).
   - `us-east-1/11_dynamodb/` – Shared DynamoDB tables:
     - `reddit_ingestion_checkpoints` table for listing-based checkpoints.
-    - `lambda_run_logs` table for recording per-run metadata.
+    - `lambda_run_logs` table for recording per-run Lambda metadata with timestamp ranges.
+    - `glue_ingestion_metrics` table for Glue bronze ingestion metrics.
   - `us-east-1/20_lambda/` – Reddit ingestion Lambda:
     - Lambda function, IAM roles/policies.
     - Uses shared DynamoDB tables from `11_dynamodb` for checkpoints and run metadata.
@@ -60,9 +61,28 @@ The current scope focuses on **Reddit ingestion into the landing and bronze laye
 
 ### High-Level Flow
 
+```
+EventBridge (schedule)
+    │
+    ▼
+Step Functions (reddit_listing_ingestion)
+    │
+    ├─► Compute PROCESS_DATE from execution start time
+    │
+    ├─► For each (subreddit, sort_type):
+    │       └─► Lambda (reddit-ingestion)
+    │               └─► Write JSONL to S3 landing zone
+    │
+    └─► Glue Job (reddit_bronze_ingestion)
+            └─► Read fresh partition → MERGE into Bronze Iceberg tables
+```
+
 1. **Schedule (EventBridge + Step Functions)**
-   - An EventBridge rule in `aws/us-east-1/40_eventbridge` triggers the `reddit_listing_ingestion` Step Functions state machine on a configured schedule (for example, `rate(1 hour)`).
-   - The Step Function fans out into multiple Lambda invocations, each handling a single `(subreddit, sort_type)` listing ingestion.
+   - An EventBridge rule in `aws/us-east-1/40_eventbridge` triggers the `reddit_listing_ingestion` Step Functions state machine on a configured schedule (for example, daily at midnight UTC).
+   - The Step Function:
+     1. Computes `PROCESS_DATE` from the execution start time (format: `DD-MM-YYYY`).
+     2. Fans out into multiple Lambda invocations, each handling a single `(subreddit, sort_type)` listing ingestion.
+     3. After all Lambda invocations complete, triggers the Glue bronze ingestion job with the computed `PROCESS_DATE`.
 
 2. **Lambda Handler (`lambda/ingestion/handler.py`)**
    - Reads configuration from environment variables:
@@ -124,11 +144,15 @@ The current scope focuses on **Reddit ingestion into the landing and bronze laye
        - `pk = "ENV#{environment}#SUBREDDIT#{subreddit}"`.
        - `sk = "RUN#{run_timestamp}#{sort_type}"`.
        - Attributes include `SubmissionsCount`, `CommentsCount`, `Mode`, `SortType`, `TimeFilter`, `S3Prefix`, `IngestedAtTs`.
+       - **New timestamp fields**: `EarliestSubmissionCreatedUtc`, `LatestSubmissionCreatedUtc`, `EarliestCommentCreatedUtc`, `LatestCommentCreatedUtc`.
      - Publishes CloudWatch metrics for each run:
        - Namespace: `RedditIngestion`.
        - Metrics:
          - `SubmissionsFetched` (Count).
          - `CommentsFetched` (Count).
+         - `SubmissionTimeSpanSeconds` (Seconds) – span between earliest and latest submission.
+         - `CommentTimeSpanSeconds` (Seconds) – span between earliest and latest comment.
+         - `EarliestSubmissionAge`, `LatestSubmissionAge` (Unix timestamps).
        - Dimensions: `Environment`, `Subreddit`, `SortType`.
    - All operations log successes and failures via the module logger.
 
@@ -158,7 +182,8 @@ Located at `aws/us-east-1/11_dynamodb/`:
 
 - Provisions shared DynamoDB tables:
   - `reddit_ingestion_checkpoints` – listing-based checkpoint store.
-  - `lambda_run_logs` – generic Lambda run logs.
+  - `lambda_run_logs` – Lambda run metadata with timestamp ranges.
+  - `glue_ingestion_metrics` – Glue bronze ingestion metrics (aggregate and per-subreddit).
 - Tables use:
   - Partition key: `pk` (string).
   - Sort key: `sk` (string).
@@ -217,7 +242,9 @@ Located at `aws/us-east-1/21_glue/`:
   - Glue job `reddit_bronze_ingestion`:
     - Reads landing JSONL files.
     - Adds audit columns (`ingestion_timestamp`, `source_file`, `source_sort_type`, `partition_date`).
-    - Writes into Bronze Iceberg tables using MERGE semantics.
+    - Filters to **only the fresh partition** when `--PROCESS_DATE` is provided.
+    - Writes into Bronze Iceberg tables using MERGE semantics (upsert by `id`, keep latest `updated_at`).
+    - **Metrics**: Computes per-subreddit and aggregate metrics (counts, timestamp ranges) and writes to DynamoDB and CloudWatch.
 
 ### `30_stepfunction`
 
@@ -226,11 +253,19 @@ Located at `aws/us-east-1/30_stepfunction/`:
 - **Backend**: Uses the same S3 backend with key `30_stepfunction/terraform.tfstate`.
 - **Data sources**:
   - `terraform_remote_state.lambda` – fetch Lambda ARN from `20_lambda`.
+  - `terraform_remote_state.glue` – fetch Glue job name from `21_glue`.
 - **Resources**:
-  - IAM role for Step Functions with permission to invoke the ingestion Lambda.
+  - IAM role for Step Functions with permissions to:
+    - Invoke the ingestion Lambda.
+    - Start the Glue bronze ingestion job.
   - `aws_sfn_state_machine.reddit_listing_ingestion`:
     - Definition loaded from `listing_ingestion_state_machine.asl.json`.
-    - Uses a templated list of invocations (subreddit + sort_type combinations).
+    - **State machine flow**:
+      1. `ComputeProcessDate` – Extracts date from `$$.Execution.StartTime`.
+      2. `FormatProcessDate` – Formats date as `DD-MM-YYYY` to match S3 partition structure.
+      3. `GenerateInvocations` – Prepares the list of `(subreddit, sort_type)` combinations.
+      4. `ProcessSubreddits` – Map state that invokes Lambda for each combination.
+      5. `StartBronzeIngestion` – Starts the Glue job with `--PROCESS_DATE` argument.
 
 ### `40_eventbridge`
 
@@ -245,6 +280,30 @@ Located at `aws/us-east-1/40_eventbridge/`:
   - `aws_cloudwatch_event_target.reddit_ingestion_stepfunction`:
     - Targets the `reddit_listing_ingestion` Step Function.
   - IAM role for EventBridge to start Step Function executions.
+
+---
+
+## Fresh Partition Processing and Backfills
+
+### PROCESS_DATE
+
+The `PROCESS_DATE` parameter (format: `DD-MM-YYYY`) controls which S3 partition the Glue bronze ingestion job processes:
+
+- **Automated runs**: The Step Function computes `PROCESS_DATE` from the execution start time and passes it to the Glue job. This ensures only freshly ingested data is processed.
+- **Standalone Glue runs**: If `--PROCESS_DATE` is not provided, the Glue job defaults to today's UTC date.
+
+### Manual Backfills
+
+To process historical partitions, you can:
+
+1. **Run the Glue job directly** with a specific `PROCESS_DATE`:
+   ```bash
+   aws glue start-job-run \
+     --job-name tf-prod-smartcomp-glue-reddit-bronze-ingestion \
+     --arguments '{"--PROCESS_DATE":"15-11-2024"}'
+   ```
+
+2. **Use the backfill script** (`run_reddit_backfill.sh`) to trigger Step Function executions over a historical time range. Each execution will ingest data for that day and run the Glue job for that partition.
 
 ---
 
@@ -350,17 +409,129 @@ Check:
 - S3: new JSONL objects under `reddit/{subreddit}/...`.
 - CloudWatch Logs: INFO logs for window selection, ingestion, recording, and metrics.
 
+## Metrics & Monitoring
+
+The platform provides comprehensive monitoring at two layers: Lambda ingestion and Glue bronze processing.
+
+### DynamoDB Tables
+
+| Table | Purpose | Key Structure |
+|-------|---------|---------------|
+| `lambda_run_logs` | Per-run Lambda ingestion metadata | `pk=ENV#{env}#SUBREDDIT#{sub}`, `sk=RUN#{ts}#{sort}` |
+| `glue_ingestion_metrics` | Per-run Glue bronze metrics (aggregate + per-subreddit) | `pk=ENV#{env}#SUBREDDIT#{sub}` or `ENV#{env}#AGGREGATE`, `sk=GLUE_RUN#{date}#{run_id}` |
+| `reddit_ingestion_checkpoints` | Listing-based checkpoint storage | `pk=ENV#{env}#SUBREDDIT#{sub}`, `sk=CHECKPOINT#{type}#{sort}#{time}` |
+
+### Lambda Ingestion Metrics
+
+**DynamoDB Attributes** (`lambda_run_logs` table per run):
+
+| Attribute | Description |
+|-----------|-------------|
+| `SubmissionsCount` | Number of submissions fetched |
+| `CommentsCount` | Number of comments fetched |
+| `EarliestSubmissionCreatedUtc` | Unix timestamp of oldest submission in batch |
+| `LatestSubmissionCreatedUtc` | Unix timestamp of newest submission in batch |
+| `EarliestCommentCreatedUtc` | Unix timestamp of oldest comment in batch |
+| `LatestCommentCreatedUtc` | Unix timestamp of newest comment in batch |
+| `SortType` | `top` or `controversial` |
+| `TimeFilter` | `all`, `year`, `month`, etc. |
+| `S3Prefix` | S3 location where data was written |
+
+**CloudWatch Metrics** (Namespace: `RedditIngestion`):
+
+| Metric | Unit | Dimensions |
+|--------|------|------------|
+| `SubmissionsFetched` | Count | Environment, Subreddit, SortType |
+| `CommentsFetched` | Count | Environment, Subreddit, SortType |
+| `SubmissionTimeSpanSeconds` | Seconds | Environment, Subreddit, SortType |
+| `CommentTimeSpanSeconds` | Seconds | Environment, Subreddit, SortType |
+| `EarliestSubmissionAge` | None (Unix timestamp) | Environment, Subreddit, SortType |
+| `LatestSubmissionAge` | None (Unix timestamp) | Environment, Subreddit, SortType |
+
+### Glue Bronze Ingestion Metrics
+
+**DynamoDB Attributes** (`glue_ingestion_metrics` table):
+
+For **aggregate runs** (pk=`ENV#{env}#AGGREGATE`):
+
+| Attribute | Description |
+|-----------|-------------|
+| `TotalSubmissions` | Total submissions processed across all subreddits |
+| `TotalComments` | Total comments processed across all subreddits |
+| `SubredditsProcessed` | Number of distinct subreddits in the partition |
+| `EarliestSubmissionCreatedUtc` | Global earliest submission timestamp |
+| `LatestSubmissionCreatedUtc` | Global latest submission timestamp |
+| `EarliestCommentCreatedUtc` | Global earliest comment timestamp |
+| `LatestCommentCreatedUtc` | Global latest comment timestamp |
+| `ProcessDate` | Partition date processed (DD-MM-YYYY) |
+| `RunId` | Unique identifier for this job run |
+
+For **per-subreddit runs** (pk=`ENV#{env}#SUBREDDIT#{sub}`):
+
+| Attribute | Description |
+|-----------|-------------|
+| `SubmissionsCount` | Submissions processed for this subreddit |
+| `CommentsCount` | Comments processed for this subreddit |
+| `EarliestSubmissionCreatedUtc` | Earliest submission timestamp for this subreddit |
+| `LatestSubmissionCreatedUtc` | Latest submission timestamp for this subreddit |
+| `EarliestCommentCreatedUtc` | Earliest comment timestamp for this subreddit |
+| `LatestCommentCreatedUtc` | Latest comment timestamp for this subreddit |
+
+**CloudWatch Metrics** (Namespace: `RedditBronzeIngestion`):
+
+| Metric | Unit | Dimensions |
+|--------|------|------------|
+| `SubmissionsProcessed` | Count | Environment, ProcessDate |
+| `CommentsProcessed` | Count | Environment, ProcessDate |
+| `SubredditsProcessed` | Count | Environment, ProcessDate |
+| `SubmissionTimeSpanSeconds` | Seconds | Environment, ProcessDate |
+| `CommentTimeSpanSeconds` | Seconds | Environment, ProcessDate |
+
+### Example Queries
+
+**Query Lambda run history for a subreddit:**
+
+```bash
+aws dynamodb query \
+  --table-name tf-prod-smartcomp-lambda-run-logs \
+  --key-condition-expression "pk = :pk" \
+  --expression-attribute-values '{":pk":{"S":"ENV#prod#SUBREDDIT#smartphones"}}' \
+  --scan-index-forward false \
+  --limit 10
+```
+
+**Query Glue metrics for a specific date:**
+
+```bash
+aws dynamodb query \
+  --table-name tf-prod-smartcomp-glue-ingestion-metrics \
+  --key-condition-expression "pk = :pk AND begins_with(sk, :sk_prefix)" \
+  --expression-attribute-values '{":pk":{"S":"ENV#prod#AGGREGATE"},":sk_prefix":{"S":"GLUE_RUN#09-12-2025"}}'
+```
+
+**CloudWatch Insights query for submission counts by subreddit:**
+
+```
+fields @timestamp, @message
+| filter @message like /SubmissionsFetched/
+| stats sum(SubmissionsFetched) by Subreddit
+```
+
+---
+
 ## Logging & Observability
 
-- All core components (`ingestion_service`, `state_store`, `run_metadata`, and the Lambda handler) use Python’s `logging` module:
+- All core components (`ingestion_service`, `state_store`, `run_metadata`, and the Lambda handler) use Python's `logging` module:
   - High-level events at `INFO`.
   - Warnings for abnormal-but-non-fatal conditions (e.g., invalid SSM values).
   - Errors for unexpected AWS API or runtime failures.
 - Metrics:
-  - `SubmissionsFetched` and `CommentsFetched` per run in CloudWatch under the `RedditIngestion` namespace, with `Environment`, `Subreddit`, and `SortType` dimensions.
+  - Lambda: `SubmissionsFetched`, `CommentsFetched`, and timestamp span metrics in CloudWatch under the `RedditIngestion` namespace.
+  - Glue: `SubmissionsProcessed`, `CommentsProcessed`, `SubredditsProcessed`, and timestamp span metrics under the `RedditBronzeIngestion` namespace.
 - Run history:
   - DynamoDB `lambda_run_logs` table allows you to query history per subreddit and environment, order by `sk` for time ordering, and audit ingestion coverage.
+  - DynamoDB `glue_ingestion_metrics` table stores per-run and per-subreddit Glue job metrics.
 
-This design keeps the ingestion pipeline modular, observable, and aligned with a staged Terraform layout, making it easier to extend later (e.g., sentiment analysis, augmented zone loading) without changing the existing contracts. 
+This design keeps the ingestion pipeline modular, observable, and aligned with a staged Terraform layout, making it easier to extend later (e.g., sentiment analysis, augmented zone loading) without changing the existing contracts.
 
 
