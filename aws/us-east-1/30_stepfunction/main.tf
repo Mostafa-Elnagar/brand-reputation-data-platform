@@ -17,6 +17,7 @@ resource "aws_sfn_state_machine" "reddit_listing_ingestion" {
   definition = templatefile("${path.module}/listing_ingestion_state_machine.asl.json", {
     lambda_function_arn = data.terraform_remote_state.lambda.outputs.reddit_ingestion_lambda_arn
     invocations_json    = jsonencode(local.invocations)
+    glue_job_name       = data.terraform_remote_state.glue.outputs.bronze_ingestion_job_name
   })
 
   tags = local.default_tags

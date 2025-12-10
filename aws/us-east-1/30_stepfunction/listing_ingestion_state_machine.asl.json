@@ -1,10 +1,28 @@
 {
-  "Comment": "Ingest Reddit listings for multiple subreddits sequentially",
-  "StartAt": "GenerateInvocations",
+  "Comment": "Ingest Reddit listings for multiple subreddits, then trigger Bronze layer Glue job",
+  "StartAt": "ComputeProcessDate",
   "States": {
+    "ComputeProcessDate": {
+      "Type": "Pass",
+      "Comment": "Extract the execution date from StartTime to use as PROCESS_DATE for Glue",
+      "Parameters": {
+        "execution_start_time.$": "$$.Execution.StartTime",
+        "date_parts.$": "States.StringSplit(States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0), '-')"
+      },
+      "Next": "FormatProcessDate"
+    },
+    "FormatProcessDate": {
+      "Type": "Pass",
+      "Comment": "Format date as DD-MM-YYYY to match S3 partition structure",
+      "Parameters": {
+        "process_date.$": "States.Format('{}-{}-{}', States.ArrayGetItem($.date_parts, 2), States.ArrayGetItem($.date_parts, 1), States.ArrayGetItem($.date_parts, 0))"
+      },
+      "Next": "GenerateInvocations"
+    },
     "GenerateInvocations": {
       "Type": "Pass",
       "Parameters": {
+        "process_date.$": "$.process_date",
         "invocations": ${invocations_json}
       },
       "Next": "ProcessSubreddits"
@@ -13,6 +31,7 @@
       "Type": "Map",
       "ItemsPath": "$.invocations",
       "MaxConcurrency": 1,
+      "ResultPath": "$.lambdaResults",
       "ItemProcessor": {
         "ProcessorConfig": {
           "Mode": "INLINE"
@@ -45,6 +64,26 @@
           }
         }
       },
+      "Next": "StartBronzeIngestion"
+    },
+    "StartBronzeIngestion": {
+      "Type": "Task",
+      "Comment": "Start Glue job to process freshly ingested data into Bronze Iceberg tables",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${glue_job_name}",
+        "Arguments": {
+          "--PROCESS_DATE.$": "$.process_date"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Glue.ConcurrentRunsExceededException"],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
       "End": true
     }
   }

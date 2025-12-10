@@ -9,3 +9,12 @@ data "terraform_remote_state" "lambda" {
     region = "us-east-1"
   }
 }
+
+data "terraform_remote_state" "glue" {
+  backend = "s3"
+  config = {
+    bucket = "brandrep-terraform-state-backend"
+    key    = "21_glue/terraform.tfstate"
+    region = "us-east-1"
+  }
+}
