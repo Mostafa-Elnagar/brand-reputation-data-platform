@@ -85,17 +85,32 @@ class RedditIngestionRunRecorder:
             "S3Prefix": {"S": result.s3_prefix},
         }
 
+        # Add timestamp range fields if available
+        if result.earliest_submission_created_utc is not None:
+            item["EarliestSubmissionCreatedUtc"] = {"N": str(result.earliest_submission_created_utc)}
+        if result.latest_submission_created_utc is not None:
+            item["LatestSubmissionCreatedUtc"] = {"N": str(result.latest_submission_created_utc)}
+        if result.earliest_comment_created_utc is not None:
+            item["EarliestCommentCreatedUtc"] = {"N": str(result.earliest_comment_created_utc)}
+        if result.latest_comment_created_utc is not None:
+            item["LatestCommentCreatedUtc"] = {"N": str(result.latest_comment_created_utc)}
+
         try:
             self._dynamodb.put_item(
                 TableName=self._dynamodb_table_name,
                 Item=item,
             )
             LOGGER.info(
-                "Recorded ingestion run pk=%s sk=%s submissions=%d comments=%d",
+                "Recorded ingestion run pk=%s sk=%s submissions=%d comments=%d "
+                "submission_range=[%s, %s] comment_range=[%s, %s]",
                 pk,
                 sk,
                 result.submissions_count,
                 result.comments_count,
+                result.earliest_submission_created_utc,
+                result.latest_submission_created_utc,
+                result.earliest_comment_created_utc,
+                result.latest_comment_created_utc,
             )
         except ClientError as exc:
             LOGGER.error("Failed to write ingestion run to DynamoDB: %s", exc)
@@ -109,22 +124,67 @@ class RedditIngestionRunRecorder:
                 {"Name": "SortType", "Value": result.sort_type},
             ]
 
+            metric_data: List[Dict[str, Any]] = [
+                {
+                    "MetricName": "SubmissionsFetched",
+                    "Dimensions": dimensions,
+                    "Value": float(result.submissions_count),
+                    "Unit": "Count",
+                },
+                {
+                    "MetricName": "CommentsFetched",
+                    "Dimensions": dimensions,
+                    "Value": float(result.comments_count),
+                    "Unit": "Count",
+                },
+            ]
+
+            # Add submission timestamp span if available
+            if (
+                result.earliest_submission_created_utc is not None
+                and result.latest_submission_created_utc is not None
+            ):
+                submission_span_seconds = (
+                    result.latest_submission_created_utc - result.earliest_submission_created_utc
+                )
+                metric_data.append({
+                    "MetricName": "SubmissionTimeSpanSeconds",
+                    "Dimensions": dimensions,
+                    "Value": float(submission_span_seconds),
+                    "Unit": "Seconds",
+                })
+                # Also publish earliest and latest as timestamps for monitoring
+                metric_data.append({
+                    "MetricName": "EarliestSubmissionAge",
+                    "Dimensions": dimensions,
+                    "Value": float(result.earliest_submission_created_utc),
+                    "Unit": "None",
+                })
+                metric_data.append({
+                    "MetricName": "LatestSubmissionAge",
+                    "Dimensions": dimensions,
+                    "Value": float(result.latest_submission_created_utc),
+                    "Unit": "None",
+                })
+
+            # Add comment timestamp span if available
+            if (
+                result.earliest_comment_created_utc is not None
+                and result.latest_comment_created_utc is not None
+            ):
+                comment_span_seconds = (
+                    result.latest_comment_created_utc - result.earliest_comment_created_utc
+                )
+                metric_data.append({
+                    "MetricName": "CommentTimeSpanSeconds",
+                    "Dimensions": dimensions,
+                    "Value": float(comment_span_seconds),
+                    "Unit": "Seconds",
+                })
+
             self._cloudwatch.put_metric_data(
                 Namespace=self._cloudwatch_namespace,
-                MetricData=[
-                    {
-                        "MetricName": "SubmissionsFetched",
-                        "Dimensions": dimensions,
-                        "Value": float(result.submissions_count),
-                        "Unit": "Count",
-                    },
-                    {
-                        "MetricName": "CommentsFetched",
-                        "Dimensions": dimensions,
-                        "Value": float(result.comments_count),
-                        "Unit": "Count",
-                    },
-                ],
+                MetricData=metric_data,
             )
             LOGGER.info(
                 "Published metrics for subreddit=%s sort_type=%s submissions=%d comments=%d",
