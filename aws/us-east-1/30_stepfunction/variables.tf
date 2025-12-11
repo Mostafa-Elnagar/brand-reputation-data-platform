@@ -9,7 +9,7 @@ variable "ManagedBy" {}
 variable "subreddits" {
   description = "List of subreddits to ingest"
   type        = list(string)
-  default     = ["smartphones", "phones", "PickAnAndroidForMe"]
+  default     = ["Smartphones", "phones", "PickAnAndroidForMe"]
 }
 
 variable "sort_types" {

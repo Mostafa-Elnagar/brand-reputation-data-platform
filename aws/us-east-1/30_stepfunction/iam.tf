@@ -43,6 +43,36 @@ data "aws_iam_policy_document" "sfn_policy" {
       data.terraform_remote_state.glue.outputs.bronze_ingestion_job_arn,
     ]
   }
+
+  statement {
+    sid = "AllowStartGlueSilverCoreJob"
+
+    actions = [
+      "glue:StartJobRun",
+      "glue:GetJobRun",
+      "glue:GetJobRuns",
+      "glue:BatchStopJobRun",
+    ]
+
+    resources = [
+      data.terraform_remote_state.glue_enrichment.outputs.silver_core_job_arn,
+    ]
+  }
+
+  statement {
+    sid = "AllowStartGlueSilverSentimentJob"
+
+    actions = [
+      "glue:StartJobRun",
+      "glue:GetJobRun",
+      "glue:GetJobRuns",
+      "glue:BatchStopJobRun",
+    ]
+
+    resources = [
+      data.terraform_remote_state.glue_enrichment.outputs.silver_sentiment_job_arn,
+    ]
+  }
 }
 
 resource "aws_iam_policy" "reddit_listing_ingestion_policy" {

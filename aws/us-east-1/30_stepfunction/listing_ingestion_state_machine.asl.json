@@ -1,7 +1,18 @@
 {
   "Comment": "Ingest Reddit listings for multiple subreddits, then trigger Bronze layer Glue job",
-  "StartAt": "ComputeProcessDate",
+  "StartAt": "CheckInputDate",
   "States": {
+    "CheckInputDate": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.process_date",
+          "IsPresent": true,
+          "Next": "GenerateInvocations"
+        }
+      ],
+      "Default": "ComputeProcessDate"
+    },
     "ComputeProcessDate": {
       "Type": "Pass",
       "Comment": "Extract the execution date from StartTime to use as PROCESS_DATE for Glue",
@@ -30,6 +41,10 @@
     "ProcessSubreddits": {
       "Type": "Map",
       "ItemsPath": "$.invocations",
+      "ItemSelector": {
+        "subreddit.$": "$$.Map.Item.Value.subreddit",
+        "sort_type.$": "$$.Map.Item.Value.sort_type"
+      },
       "MaxConcurrency": 1,
       "ResultPath": "$.lambdaResults",
       "ItemProcessor": {
@@ -53,7 +68,11 @@
             },
             "Retry": [
               {
-                "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException", "States.Timeout"],
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.TooManyRequestsException",
+                  "States.Timeout"
+                ],
                 "IntervalSeconds": 5,
                 "MaxAttempts": 3,
                 "BackoffRate": 2
@@ -78,7 +97,53 @@
       },
       "Retry": [
         {
-          "ErrorEquals": ["Glue.ConcurrentRunsExceededException"],
+          "ErrorEquals": [
+            "Glue.ConcurrentRunsExceededException"
+          ],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "StartSilverCore"
+    },
+    "StartSilverCore": {
+      "Type": "Task",
+      "Comment": "Start Glue job to clean Bronze data and create Silver-core tables with usability flags",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${silver_core_job_name}",
+        "Arguments": {
+          "--PROCESS_DATE.$": "$.process_date"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Glue.ConcurrentRunsExceededException"
+          ],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "StartSilverSentimentAnalysis"
+    },
+    "StartSilverSentimentAnalysis": {
+      "Type": "Task",
+      "Comment": "Start Glue job to perform targeted sentiment analysis (Silver layer)",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${silver_sentiment_job_name}",
+        "Arguments": {
+          "--PROCESS_DATE.$": "$.process_date"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Glue.ConcurrentRunsExceededException"
+          ],
           "IntervalSeconds": 60,
           "MaxAttempts": 3,
           "BackoffRate": 2

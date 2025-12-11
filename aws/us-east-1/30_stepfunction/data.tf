@@ -6,7 +6,7 @@ data "terraform_remote_state" "lambda" {
   config = {
     bucket = "brandrep-terraform-state-backend"
     key    = "20_lambda/terraform.tfstate"
-    region = "us-east-1"
+    region = var.region
   }
 }
 
@@ -15,6 +15,15 @@ data "terraform_remote_state" "glue" {
   config = {
     bucket = "brandrep-terraform-state-backend"
     key    = "21_glue/terraform.tfstate"
-    region = "us-east-1"
+    region = var.region
+  }
+}
+
+data "terraform_remote_state" "glue_enrichment" {
+  backend = "s3"
+  config = {
+    bucket = "brandrep-terraform-state-backend"
+    key    = "22_glue_enrichment/terraform.tfstate"
+    region = var.region
   }
 }
