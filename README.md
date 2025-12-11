@@ -7,6 +7,7 @@ The current scope focuses on **Reddit ingestion into the landing and bronze laye
 - An AWS Lambda function that performs **listing-based** ingestion from Reddit.
 - A Step Functions state machine triggered by EventBridge on a **schedule**.
 - Landing-zone JSONL data in S3, and **Bronze Iceberg tables** populated via AWS Glue.
+- **Silver Layer** enrichment with sentiment analysis using Google Gemini Flash.
 - Run metadata and checkpoints stored in DynamoDB, plus metrics in CloudWatch.
 
 ---
@@ -16,7 +17,7 @@ The current scope focuses on **Reddit ingestion into the landing and bronze laye
 - `aws/`
   - `us-east-1/10_s3/` – S3 data lake buckets:
     - Landing zone: raw Reddit data.
-    - Augmented zone: (reserved for later processing stages).
+    - Lakehouse bucket: Bronze/Silver/Gold Iceberg tables.
   - `us-east-1/11_dynamodb/` – Shared DynamoDB tables:
     - `reddit_ingestion_checkpoints` table for listing-based checkpoints.
     - `lambda_run_logs` table for recording per-run Lambda metadata with timestamp ranges.
@@ -30,8 +31,12 @@ The current scope focuses on **Reddit ingestion into the landing and bronze laye
     - Bronze Glue database and Iceberg tables for submissions and comments.
     - Crawlers for landing-zone `submissions.jsonl` and `comments.jsonl`.
     - Glue job for **Bronze ingestion** from landing JSONL to Iceberg tables.
+  - `us-east-1/22_glue_enrichment/` – Silver Layer Enrichment:
+    - **Silver Core**: Cleans and prepares data for analysis.
+    - **Silver Sentiment**: Performs sentiment analysis using Gemini Flash model.
   - `us-east-1/30_stepfunction/` – Step Functions state machine:
     - Orchestrates listing-based ingestion using multiple Lambda invocations.
+    - Triggers Bronze and Silver Glue jobs sequentially.
   - `us-east-1/40_eventbridge/` – EventBridge rule and target:
     - Triggers the Step Functions state machine on a schedule.
 - `modules/`
@@ -44,6 +49,10 @@ The current scope focuses on **Reddit ingestion into the landing and bronze laye
     - `ingestion_service.py` – Orchestrates fetching, serialization, and writing.
     - `state_store.py` – DynamoDB-backed checkpoint store for listing-based ingestion.
     - `run_metadata.py` – Persists run metadata to DynamoDB and publishes CloudWatch metrics.
+  - `sentiment_analysis/`
+    - `gemini_client.py` – Async client for Google Gemini API with rate limiting.
+    - `prompt_builder.py` – Constructs prompts for sentiment analysis.
+    - `normalizer.py` – Standardizes brand and product names.
 - `lambda/`
   - `ingestion/handler.py` – AWS Lambda handler wiring together the Reddit client, listing fetcher, ingestion service, checkpoint store, and run recorder.
 - `scripts/`
@@ -73,16 +82,22 @@ Step Functions (reddit_listing_ingestion)
     │       └─► Lambda (reddit-ingestion)
     │               └─► Write JSONL to S3 landing zone
     │
-    └─► Glue Job (reddit_bronze_ingestion)
-            └─► Read fresh partition → MERGE into Bronze Iceberg tables
+    ├─► Glue Job (reddit_bronze_ingestion)
+    │       └─► Read fresh partition → MERGE into Bronze Iceberg tables
+    │
+    ├─► Glue Job (reddit_silver_core)
+    │       └─► Clean & Prepare data → Silver Core Iceberg tables
+    │
+    └─► Glue Job (reddit_silver_sentiment)
+            └─► Analyze Sentiment (Gemini) → Silver Sentiment Iceberg tables
 ```
 
 1. **Schedule (EventBridge + Step Functions)**
    - An EventBridge rule in `aws/us-east-1/40_eventbridge` triggers the `reddit_listing_ingestion` Step Functions state machine on a configured schedule (for example, daily at midnight UTC).
    - The Step Function:
-     1. Computes `PROCESS_DATE` from the execution start time (format: `DD-MM-YYYY`).
+     1. Computes `PROCESS_DATE` from the execution start time (format: `DD-MM-YYYY`) OR uses the provided `process_date` input.
      2. Fans out into multiple Lambda invocations, each handling a single `(subreddit, sort_type)` listing ingestion.
-     3. After all Lambda invocations complete, triggers the Glue bronze ingestion job with the computed `PROCESS_DATE`.
+     3. Triggers Glue Bronze ingestion, followed by Silver Core and Silver Sentiment jobs, passing the `PROCESS_DATE`.
 
 2. **Lambda Handler (`lambda/ingestion/handler.py`)**
    - Reads configuration from environment variables:
@@ -166,13 +181,13 @@ Located at `aws/us-east-1/10_s3/`:
 
 - Provisions S3 buckets using `terraform-aws-modules/s3-bucket/aws`:
   - **Landing zone bucket**: `${local.name_prefix}-lz`
-  - **Augmented zone bucket**: `${local.name_prefix}-augmented`
+  - **Lakehouse bucket**: `${local.name_prefix}-lakehouse`
 - Buckets enforce:
   - Blocked public access.
   - Server-side encryption (SSE-S3 or KMS).
 - Outputs:
   - `s3_landing_zone_bucket_id`, `s3_landing_zone_bucket_arn`
-  - `s3_augmented_zone_bucket_id`, `s3_augmented_zone_bucket_arn`
+  - `s3_lakehouse_bucket_id`, `s3_lakehouse_bucket_arn`
 
 The Lambda stack (`20_lambda`) reads these outputs via `terraform_remote_state`.
 
@@ -245,6 +260,19 @@ Located at `aws/us-east-1/21_glue/`:
     - Filters to **only the fresh partition** when `--PROCESS_DATE` is provided.
     - Writes into Bronze Iceberg tables using MERGE semantics (upsert by `id`, keep latest `updated_at`).
     - **Metrics**: Computes per-subreddit and aggregate metrics (counts, timestamp ranges) and writes to DynamoDB and CloudWatch.
+    
+### `22_glue_enrichment`
+
+Located at `aws/us-east-1/22_glue_enrichment/`:
+
+- **Resources**:
+  - **Silver Core Job**: Cleanses Bronze data, handles deduplication, and prepares it for analysis.
+  - **Silver Sentiment Job**:
+    - Reads from Silver Core tables.
+    - Uses `modules/sentiment_analysis` to call Gemini Flash API.
+    - Performs aspect-based sentiment analysis on submissions and comments.
+    - Writes results to `sentiment_results` Iceberg table.
+    - **Optimization**: Uses `asyncio` for concurrent API calls and rate limiting.
 
 ### `30_stepfunction`
 
@@ -261,11 +289,13 @@ Located at `aws/us-east-1/30_stepfunction/`:
   - `aws_sfn_state_machine.reddit_listing_ingestion`:
     - Definition loaded from `listing_ingestion_state_machine.asl.json`.
     - **State machine flow**:
-      1. `ComputeProcessDate` – Extracts date from `$$.Execution.StartTime`.
+      1. `ComputeProcessDate` – Extracts date from `$$.Execution.StartTime` (or uses input `process_date`).
       2. `FormatProcessDate` – Formats date as `DD-MM-YYYY` to match S3 partition structure.
       3. `GenerateInvocations` – Prepares the list of `(subreddit, sort_type)` combinations.
       4. `ProcessSubreddits` – Map state that invokes Lambda for each combination.
-      5. `StartBronzeIngestion` – Starts the Glue job with `--PROCESS_DATE` argument.
+      5. `StartBronzeIngestion` – Starts the Bronze Glue job.
+      6. `StartSilverCore` – Starts the Silver Core Glue job.
+      7. `StartSilverSentimentAnalysis` – Starts the Silver Sentiment Glue job.
 
 ### `40_eventbridge`
 
@@ -532,6 +562,6 @@ fields @timestamp, @message
   - DynamoDB `lambda_run_logs` table allows you to query history per subreddit and environment, order by `sk` for time ordering, and audit ingestion coverage.
   - DynamoDB `glue_ingestion_metrics` table stores per-run and per-subreddit Glue job metrics.
 
-This design keeps the ingestion pipeline modular, observable, and aligned with a staged Terraform layout, making it easier to extend later (e.g., sentiment analysis, augmented zone loading) without changing the existing contracts.
+This design keeps the ingestion pipeline modular, observable, and aligned with a staged Terraform layout, making it easier to extend later (e.g., sentiment analysis, Silver/Gold layer processing) without changing the existing contracts.
 
 
