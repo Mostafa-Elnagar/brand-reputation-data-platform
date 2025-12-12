@@ -5,7 +5,7 @@ USE SCHEMA MART;
 
 CREATE OR REPLACE TABLE dim_submission (
     submission_key INT IDENTITY(1,1) PRIMARY KEY,
-    reddit_submission_id VARCHAR,
+    reddit_submission_id VARCHAR, -- Natural Key (Short ID, e.g. g6wj3z)
     subreddit VARCHAR,
     title VARCHAR,
     selftext VARCHAR,
@@ -26,7 +26,7 @@ INSERT INTO dim_submission (
     score
 )
 SELECT 
-    fullname_id,
+    id,
     subreddit,
     title,
     selftext,
