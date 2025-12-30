@@ -324,6 +324,79 @@ def compute_submission_metrics(df: DataFrame) -> Dict[str, SubredditMetrics]:
     return subreddit_metrics
 
 
+def ensure_iceberg_table_exists(spark, database_name, table_name, sample_df: DataFrame, table_location: str):
+    """
+    Ensure Iceberg table exists, create it if it doesn't.
+    
+    Args:
+        spark: SparkSession instance
+        database_name: Glue catalog database name
+        table_name: Table name
+        sample_df: Sample DataFrame with the correct schema
+        table_location: Explicit S3 location for the table (e.g., s3://bucket/bronze/reddit_submissions/)
+    
+    Returns:
+        True if table exists or was created, False otherwise
+    """
+    qualified_table = f"glue_catalog.{database_name}.{table_name}"
+    
+    try:
+        # Try to check if table exists by querying it
+        spark.sql(f"SELECT 1 FROM {qualified_table} LIMIT 1").collect()
+        print(f"Table {qualified_table} already exists with metadata")
+        return True
+    except Exception as table_error:
+        # Table doesn't exist or has no metadata, create it
+        error_msg = str(table_error).lower()
+        if "table" in error_msg and ("not found" in error_msg or "does not exist" in error_msg or "cannot be null" in error_msg):
+            print(f"Table {qualified_table} does not exist or has no metadata. Creating it at {table_location}...")
+            try:
+                # Get column definitions from schema
+                schema = sample_df.schema
+                columns = []
+                for field in schema.fields:
+                    col_type = field.dataType.simpleString()
+                    # Map Spark types to SQL types
+                    type_mapping = {
+                        "string": "string",
+                        "bigint": "bigint",
+                        "int": "int",
+                        "double": "double",
+                        "boolean": "boolean",
+                        "timestamp": "timestamp"
+                    }
+                    sql_type = type_mapping.get(col_type, col_type)
+                    columns.append(f"`{field.name}` {sql_type}")
+                
+                columns_str = ", ".join(columns)
+                create_sql = f"""
+                    CREATE TABLE IF NOT EXISTS {qualified_table} (
+                        {columns_str}
+                    )
+                    USING ICEBERG
+                    LOCATION '{table_location}'
+                    TBLPROPERTIES (
+                        'write.format.default' = 'parquet',
+                        'write.parquet.compression-codec' = 'zstd'
+                    )
+                """
+                
+                print(f"Creating table with explicit location: {table_location}")
+                spark.sql(create_sql)
+                
+                print(f"Successfully created Iceberg table {qualified_table} with metadata at {table_location}")
+                return True
+            except Exception as create_error:
+                print(f"Failed to create table {qualified_table}: {create_error}")
+                import traceback
+                traceback.print_exc()
+                return False
+        else:
+            # Unexpected error, re-raise
+            print(f"Unexpected error checking table {qualified_table}: {table_error}")
+            raise
+
+
 def process_submissions(spark, glue_context, landing_path, database_name, table_name, process_date=None):
     """
     Read submissions from Landing Zone and merge into Bronze Iceberg table.
@@ -384,9 +457,53 @@ def process_submissions(spark, glue_context, landing_path, database_name, table_
     record_count = df.count()
     print(f"Found {record_count} submission records to process")
     
-    df.createOrReplaceTempView("submissions_staging")
-    
+    # Ensure table exists before merging
     qualified_table = f"glue_catalog.{database_name}.{table_name}"
+    
+    # Get warehouse path from Spark config (e.g., s3://bucket/bronze/)
+    warehouse_path = spark.conf.get("spark.sql.catalog.glue_catalog.warehouse", "").rstrip("/")
+    
+    # Table location should match what's defined in Terraform locals
+    # locals.tf defines: bronze_submissions_path = "s3://.../bronze/reddit_submissions/"
+    # So we need to use the full subdirectory name
+    if table_name == "submissions":
+        table_location = f"{warehouse_path}/reddit_submissions"
+    elif table_name == "comments":
+        table_location = f"{warehouse_path}/reddit_comments"
+    else:
+        table_location = f"{warehouse_path}/{table_name}"
+    
+    print(f"Table location will be: {table_location}")
+    
+    if not ensure_iceberg_table_exists(spark, database_name, table_name, df, table_location):
+        print(f"Failed to ensure table exists. Attempting direct write...")
+        # Fallback: try to create and write in one step with explicit location
+        try:
+            # Create temp view for CREATE TABLE AS SELECT
+            df.createOrReplaceTempView("_temp_write_data")
+            create_and_write_sql = f"""
+                CREATE TABLE IF NOT EXISTS {qualified_table}
+                USING ICEBERG
+                LOCATION '{table_location}'
+                TBLPROPERTIES (
+                    'write.format.default' = 'parquet',
+                    'write.parquet.compression-codec' = 'zstd'
+                )
+            """
+            spark.sql(create_and_write_sql)
+            # Now insert data
+            df.sort("partition_date").writeTo(qualified_table).append()
+            print(f"Successfully created and wrote {record_count} submissions to {table_name}")
+            df.unpersist()
+            return record_count, subreddit_metrics
+        except Exception as e:
+            print(f"Failed to create/write table: {e}")
+            import traceback
+            traceback.print_exc()
+            df.unpersist()
+            raise
+    
+    df.createOrReplaceTempView("submissions_staging")
     
     merge_sql = f"""
         MERGE INTO {qualified_table} AS target
@@ -399,12 +516,27 @@ def process_submissions(spark, glue_context, landing_path, database_name, table_
     """
     
     try:
-        spark.sql(merge_sql)
-        print(f"Successfully merged {record_count} submissions into {table_name}")
+        print(f"Executing MERGE for {record_count} submissions...")
+        spark.sql(merge_sql)  # MERGE executes immediately, no need for show()
+        print(f"MERGE SQL executed successfully.")
+        
+        # Verify data was written by counting rows
+        written_count = spark.sql(f"SELECT COUNT(*) as cnt FROM {qualified_table}").collect()[0]["cnt"]
+        print(f"Successfully merged {record_count} submissions into {table_name}. Table now has {written_count} total rows.")
     except Exception as e:
-        print(f"MERGE failed, attempting INSERT: {e}")
-        df.writeTo(qualified_table).append()
-        print(f"Appended {record_count} submissions to {table_name}")
+        print(f"MERGE failed: {e}")
+        import traceback
+        traceback.print_exc()
+        print(f"Attempting append instead...")
+        try:
+            df.sort("partition_date").writeTo(qualified_table).append()
+            written_count = spark.sql(f"SELECT COUNT(*) as cnt FROM {qualified_table}").collect()[0]["cnt"]
+            print(f"Appended {record_count} submissions to {table_name}. Table now has {written_count} total rows.")
+        except Exception as e2:
+            print(f"Append also failed: {e2}")
+            import traceback
+            traceback.print_exc()
+            raise
 
     df.unpersist()
     
@@ -500,9 +632,46 @@ def process_comments(spark, glue_context, landing_path, database_name, table_nam
     record_count = df.count()
     print(f"Found {record_count} comment records to process")
     
-    df.createOrReplaceTempView("comments_staging")
-    
+    # Ensure table exists before merging
     qualified_table = f"glue_catalog.{database_name}.{table_name}"
+    # Determine table location based on table name
+    warehouse_path = spark.conf.get("spark.sql.catalog.glue_catalog.warehouse", "").rstrip("/")
+    if table_name == "submissions":
+        table_location = f"{warehouse_path}/reddit_submissions"
+    elif table_name == "comments":
+        table_location = f"{warehouse_path}/reddit_comments"
+    else:
+        table_location = f"{warehouse_path}/{table_name}"
+    
+    if not ensure_iceberg_table_exists(spark, database_name, table_name, df, table_location):
+        print(f"Failed to ensure table exists. Attempting direct write...")
+        # Fallback: try to create and write in one step with explicit location
+        try:
+            # Create temp view for CREATE TABLE AS SELECT
+            df.createOrReplaceTempView("_temp_write_data")
+            create_and_write_sql = f"""
+                CREATE TABLE IF NOT EXISTS {qualified_table}
+                USING ICEBERG
+                LOCATION '{table_location}'
+                TBLPROPERTIES (
+                    'write.format.default' = 'parquet',
+                    'write.parquet.compression-codec' = 'zstd'
+                )
+            """
+            spark.sql(create_and_write_sql)
+            # Now insert data
+            df.sort("partition_date").writeTo(qualified_table).append()
+            print(f"Successfully created and wrote {record_count} comments to {table_name}")
+            df.unpersist()
+            return record_count, comment_metrics
+        except Exception as e:
+            print(f"Failed to create/write table: {e}")
+            import traceback
+            traceback.print_exc()
+            df.unpersist()
+            raise
+    
+    df.createOrReplaceTempView("comments_staging")
     
     merge_sql = f"""
         MERGE INTO {qualified_table} AS target
@@ -515,12 +684,27 @@ def process_comments(spark, glue_context, landing_path, database_name, table_nam
     """
     
     try:
-        spark.sql(merge_sql)
-        print(f"Successfully merged {record_count} comments into {table_name}")
+        print(f"Executing MERGE for {record_count} comments...")
+        spark.sql(merge_sql)  # MERGE executes immediately, no need for show()
+        print(f"MERGE SQL executed successfully.")
+        
+        # Verify data was written by counting rows
+        written_count = spark.sql(f"SELECT COUNT(*) as cnt FROM {qualified_table}").collect()[0]["cnt"]
+        print(f"Successfully merged {record_count} comments into {table_name}. Table now has {written_count} total rows.")
     except Exception as e:
-        print(f"MERGE failed, attempting INSERT: {e}")
-        df.writeTo(qualified_table).append()
-        print(f"Appended {record_count} comments to {table_name}")
+        print(f"MERGE failed: {e}")
+        import traceback
+        traceback.print_exc()
+        print(f"Attempting append instead...")
+        try:
+            df.sort("partition_date").writeTo(qualified_table).append()
+            written_count = spark.sql(f"SELECT COUNT(*) as cnt FROM {qualified_table}").collect()[0]["cnt"]
+            print(f"Appended {record_count} comments to {table_name}. Table now has {written_count} total rows.")
+        except Exception as e2:
+            print(f"Append also failed: {e2}")
+            import traceback
+            traceback.print_exc()
+            raise
 
     df.unpersist()
     
@@ -624,12 +808,12 @@ def main():
     environment = args['ENVIRONMENT']
     metrics_namespace = args['METRICS_NAMESPACE']
     
-    # Use provided PROCESS_DATE or fall back to today's date (for standalone runs)
+    # Use provided PROCESS_DATE if available, otherwise None (process all)
     process_date = args.get('PROCESS_DATE')
     if not process_date:
-        now = datetime.now(timezone.utc)
-        process_date = f"{now.day:02d}-{now.month:02d}-{now.year}"
-        print(f"No PROCESS_DATE provided, defaulting to today: {process_date}")
+        print("No PROCESS_DATE provided. Processing ALL available data in Landing Zone.")
+    else:
+        print(f"PROCESS_DATE provided: {process_date}. Filtering data to this partition.")
     
     # Generate a unique run ID for this job execution
     run_id = str(uuid.uuid4())[:8]
