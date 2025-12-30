@@ -40,17 +40,19 @@ if not logger.handlers:
     logger.addHandler(handler)
 
 
-args = getResolvedOptions(
-    sys.argv,
-    [
-        'JOB_NAME',
-        'LAKEHOUSE_BUCKET',
-        'SILVER_DATABASE',
-        'GEMINI_SECRET_ARN',
-        'ENVIRONMENT',
-        'REF_DATA_S3_PATH',
-    ],
-)
+required_params = [
+    'JOB_NAME',
+    'LAKEHOUSE_BUCKET',
+    'SILVER_DATABASE',
+    'GEMINI_SECRET_ARN',
+    'ENVIRONMENT',
+    'REF_DATA_S3_PATH',
+]
+
+if any('--PROCESS_DATE' in arg for arg in sys.argv):
+    required_params.append('PROCESS_DATE')
+
+args = getResolvedOptions(sys.argv, required_params)
 
 # Optional arguments
 PROCESS_DATE = args.get('PROCESS_DATE')
@@ -74,27 +76,35 @@ spark.conf.set("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws
 def get_secret(secret_arn: str) -> list:
     """Fetch API keys from AWS Secrets Manager.
     
-    Expects secret to be a JSON array: ["key1", "key2", "key3"]
-    Falls back to single key string for backward compatibility.
+    Supports:
+    - JSON Array: ["key1", "key2"]
+    - JSON Object: {"k1": "key1", "k2": "key2"} (returns values)
+    - Plain text: Comma or newline separated keys
     """
     client = boto3.client('secretsmanager')
     response = client.get_secret_value(SecretId=secret_arn)
     secret_string = response['SecretString']
     
     try:
-        # Try parsing as JSON array
-        keys = json.loads(secret_string)
-        if isinstance(keys, list):
-            logger.info(f"Loaded {len(keys)} API keys from Secrets Manager")
+        data = json.loads(secret_string)
+        
+        if isinstance(data, list):
+            logger.info(f"Loaded {len(data)} API keys from JSON array")
+            return [str(k).strip() for k in data if k]
+            
+        if isinstance(data, dict):
+            # Extract values from dictionary
+            keys = [str(v).strip() for v in data.values() if v]
+            logger.info(f"Loaded {len(keys)} API keys from JSON object")
             return keys
-        else:
-            # Single key in JSON format {"key": "value"}
-            logger.warning("Secret is not a JSON array, treating as single key")
-            return [secret_string]
+            
     except json.JSONDecodeError:
-        # Plain string key (backward compatibility)
-        logger.warning("Secret is plain string, wrapping as single-key list")
-        return [secret_string]
+        pass
+        
+    # Fallback: Parse as plain text (comma or newline separated)
+    keys = [k.strip() for k in secret_string.replace(',', '\n').split('\n') if k.strip()]
+    logger.info(f"Loaded {len(keys)} API keys from plain text")
+    return keys
 
 
 def load_reference_data(spark: SparkSession, database: str, ref_data_s3_path: str) -> pd.DataFrame:
@@ -223,7 +233,7 @@ def process_batch(partition_data: Iterator[pd.DataFrame], gemini_keys: list, ref
         logger.addHandler(handler)
         logger.setLevel(logging.INFO)
     
-    print(f"Executor: Starting process_batch for partition")
+    logger.info(f"Executor: Starting process_batch for partition")
     logger.info("Executor: Initializing components")
     
     # Initialize components per executor
@@ -296,8 +306,8 @@ def process_batch(partition_data: Iterator[pd.DataFrame], gemini_keys: list, ref
     async def process_partition_async(pdf):
         import time
         results = []
-        # Limit concurrency to 15 requests at a time
-        semaphore = asyncio.Semaphore(15)
+        # Limit concurrency to 2 requests at a time (Strictly limit RPS)
+        semaphore = asyncio.Semaphore(2)
         
         tasks = []
         rows = [row for _, row in pdf.iterrows()]
@@ -309,6 +319,7 @@ def process_batch(partition_data: Iterator[pd.DataFrame], gemini_keys: list, ref
         # Create tasks
         for row in rows:
             tasks.append(process_row_async(row, semaphore))
+            
         
         # Gather results with progress tracking
         # Since asyncio.gather waits for all, we can't easily track individual completion without wrapping
@@ -327,6 +338,8 @@ def process_batch(partition_data: Iterator[pd.DataFrame], gemini_keys: list, ref
                 if completed_count % (total_rows // 10) == 0 or completed_count == total_rows:
                     percent = int((completed_count / total_rows) * 100)
                     logger.info(f"Progress: [{completed_count}/{total_rows}] {percent}% completed")
+                    
+            time.sleep(5)
         
         batch_duration = time.time() - batch_start_time
         logger.info(f"Finished API calls in {batch_duration:.2f}s. Preparing results...")
@@ -418,118 +431,158 @@ try:
     
     total_comments = context_df.count()
     if total_comments == 0:
-        logger.warning(f"No usable comments found for PROCESS_DATE = {PROCESS_DATE}. Skipping processing.")
-        job.commit()
-        sys.exit(0)
-        
-    logger.info(f"Total usable comments to process: {total_comments}")
+        if PROCESS_DATE:
+            logger.warn(f"No usable comments found for PROCESS_DATE = {PROCESS_DATE}. Skipping processing.")
+        else:
+            logger.warn("No usable comments found in Silver submissions/comments. Skipping processing.")
+    else:
+        logger.info(f"Total usable comments to process: {total_comments}")
 
-    # 4. Prepare for UDF/MapPartitions
-    logger.info("Retrieving Gemini API keys from Secrets Manager")
-    gemini_keys = get_secret(args['GEMINI_SECRET_ARN'])
-    logger.info(f"Using {len(gemini_keys)} API keys for load distribution")
-    
-    # 5. Ensure and Broadcast Reference Data
-    ref_df_pd = load_reference_data(
-        spark=spark,
-        database=args['SILVER_DATABASE'],
-        ref_data_s3_path=args['REF_DATA_S3_PATH'],
-    )
-    ref_broadcast = sc.broadcast(ref_df_pd)
-    
-    # 6. Get list of subreddits to process iteratively
-    subreddits = [row.subreddit for row in context_df.select("subreddit").distinct().collect()]
-    logger.info(f"Found {len(subreddits)} subreddits to process: {subreddits}")
-    
-    sentiment_table = f"glue_catalog.{args['SILVER_DATABASE']}.sentiment_analysis"
-    
-    # Ensure table exists first (create empty if needed)
-    # This is needed so we can append in the loop
-    try:
-        spark.sql(f"SELECT 1 FROM {sentiment_table} LIMIT 1")
-    except Exception:
-        logger.info(f"Table {sentiment_table} does not exist. Creating it first.")
-        # Create empty table with correct schema
-        empty_schema = StructType([
-            StructField("submission_id", StringType(), True),
-            StructField("comment_id", StringType(), True),
-            StructField("brand_name", StringType(), True),
-            StructField("product_name", StringType(), True),
-            StructField("aspect", StringType(), True),
-            StructField("sentiment_score", DoubleType(), True),
-            StructField("quote", StringType(), True),
-            StructField("model_version", StringType(), True),
-            StructField("analyzed_at", TimestampType(), True),
-            StructField("date_partition", StringType(), True),
-            StructField("analysis_id", StringType(), True)
-        ])
-        spark.createDataFrame([], empty_schema).writeTo(sentiment_table) \
-            .tableProperty("write.format.default", "parquet") \
-            .tableProperty("write.parquet.compression-codec", "zstd") \
-            .partitionedBy("date_partition") \
-            .createOrReplace()
-
-    processed_count = 0
-    
-    # 7. Process each subreddit iteratively
-    for subreddit in subreddits:
-        logger.info(f"--- Starting processing for subreddit: {subreddit} ---")
+        # 4. Prepare for UDF/MapPartitions
+        logger.info("Retrieving Gemini API keys from Secrets Manager")
+        gemini_keys = get_secret(args['GEMINI_SECRET_ARN'])
+        logger.info(f"Using {len(gemini_keys)} API keys for load distribution")
         
-        # Filter for current subreddit
-        subreddit_df = context_df.filter(col("subreddit") == lit(subreddit))
-        subreddit_count = subreddit_df.count()
-        logger.info(f"Subreddit {subreddit} has {subreddit_count} comments to analyze")
-        
-        if subreddit_count == 0:
-            continue
-            
-        # Apply Analysis
-        schema = StructType([
-            StructField("submission_id", StringType(), True),
-            StructField("comment_id", StringType(), True),
-            StructField("brand_name", StringType(), True),
-            StructField("product_name", StringType(), True),
-            StructField("aspect", StringType(), True),
-            StructField("sentiment_score", DoubleType(), True),
-            StructField("quote", StringType(), True),
-            StructField("model_version", StringType(), True),
-            StructField("analyzed_at", TimestampType(), True),
-            StructField("date_partition", StringType(), True),
-        ])
-        
-        silver_df = subreddit_df.mapInPandas(
-            lambda iterator: process_batch(iterator, gemini_keys, ref_broadcast),
-            schema=schema,
+        # 5. Ensure and Broadcast Reference Data
+        ref_df_pd = load_reference_data(
+            spark=spark,
+            database=args['SILVER_DATABASE'],
+            ref_data_s3_path=args['REF_DATA_S3_PATH'],
         )
+        ref_broadcast = sc.broadcast(ref_df_pd)
         
-        # Add analysis_id
-        silver_df = silver_df.withColumn(
-            "analysis_id",
-            spark_hash(col("comment_id"), col("brand_name"), col("product_name"), col("aspect"))
-            .cast(StringType()),
-        )
+        # 6. Get list of subreddits to process iteratively
+        subreddits = [row.subreddit for row in context_df.select("subreddit").distinct().collect()]
+        logger.info(f"Found {len(subreddits)} subreddits to process: {subreddits}")
         
-        # Write immediately
-        logger.info(f"Writing results for {subreddit} to {sentiment_table}")
+        sentiment_table = f"glue_catalog.{args['SILVER_DATABASE']}.sentiment_analysis"
+        
+        # Ensure table exists first (create empty if needed)
+        # This is needed so we can write/append in the loop
         try:
-            silver_df.sort("date_partition").writeTo(sentiment_table).append()
-            logger.info(f"Successfully wrote results for {subreddit}")
-            processed_count += subreddit_count
-        except Exception as e:
-            logger.error(f"Failed to write results for {subreddit}: {e}")
-            # Continue to next subreddit instead of failing entire job
-            continue
+            spark.sql(f"SELECT 1 FROM {sentiment_table} LIMIT 1")
+        except Exception:
+            logger.info(f"Table {sentiment_table} does not exist. Creating it first.")
+            # Create empty table with correct schema
+            empty_schema = StructType([
+                StructField("submission_id", StringType(), True),
+                StructField("comment_id", StringType(), True),
+                StructField("brand_name", StringType(), True),
+                StructField("product_name", StringType(), True),
+                StructField("aspect", StringType(), True),
+                StructField("sentiment_score", DoubleType(), True),
+                StructField("quote", StringType(), True),
+                StructField("model_version", StringType(), True),
+                StructField("analyzed_at", TimestampType(), True),
+                StructField("date_partition", StringType(), True),
+                StructField("analysis_id", StringType(), True)
+            ])
+            spark.createDataFrame([], empty_schema).writeTo(sentiment_table) \
+                .tableProperty("write.format.default", "parquet") \
+                .tableProperty("write.parquet.compression-codec", "zstd") \
+                .partitionedBy("date_partition") \
+                .createOrReplace()
+
+        # 7. Prepare for Incremental Processing
+        # Check if target table exists and get already processed comment_ids for this partition
+        existing_comment_ids = None
+        try:
+            spark.sql(f"SELECT 1 FROM {sentiment_table} LIMIT 1")
+            if PROCESS_DATE:
+                logger.info(f"Checking for existing records in {sentiment_table} for date {PROCESS_DATE}")
+                existing_comment_ids = spark.table(sentiment_table) \
+                    .filter(col("date_partition") == PROCESS_DATE) \
+                    .select("comment_id")
+                # Cache to avoid re-reading for every subreddit
+                existing_comment_ids.cache()
+                existing_count = existing_comment_ids.count()
+                logger.info(f"Found {existing_count} already processed comments. These will be skipped.")
+        except Exception:
+            logger.info(f"Table {sentiment_table} does not exist yet. Starting fresh.")
+
+        processed_count = 0
+        
+        # 8. Process each subreddit iteratively
+        for subreddit in subreddits:
+            logger.info(f"--- Starting processing for subreddit: {subreddit} ---")
             
-    # 8. Emit metrics
-    end_time = datetime.now(timezone.utc)
-    duration_seconds = (end_time - start_time).total_seconds()
-    
-    metrics_writer.add_metric("CommentsAnalyzedByGemini", float(processed_count), unit='Count')
-    metrics_writer.add_metric("JobDurationSeconds", duration_seconds, unit='Seconds')
-    metrics_writer.publish()
-    
-    logger.info(f"Silver-sentiment job completed successfully in {duration_seconds:.2f} seconds")
-    logger.info(f"Analyzed {processed_count} comments across {len(subreddits)} subreddits")
+            # Filter for current subreddit
+            subreddit_df = context_df.filter(col("subreddit") == lit(subreddit))
+            
+            # Incremental Check: Anti-join with existing results
+            if existing_comment_ids is not None:
+                initial_count = subreddit_df.count()
+                subreddit_df = subreddit_df.join(existing_comment_ids, "comment_id", "left_anti")
+                filtered_count = subreddit_df.count()
+                if initial_count != filtered_count:
+                    logger.info(f"Skipping {initial_count - filtered_count} already processed comments for {subreddit}")
+            
+            subreddit_count = subreddit_df.count()
+            logger.info(f"Subreddit {subreddit} has {subreddit_count} new comments to analyze")
+            
+            if subreddit_count == 0:
+                continue
+                
+            # Apply Analysis
+            schema = StructType([
+                StructField("submission_id", StringType(), True),
+                StructField("comment_id", StringType(), True),
+                StructField("brand_name", StringType(), True),
+                StructField("product_name", StringType(), True),
+                StructField("aspect", StringType(), True),
+                StructField("sentiment_score", DoubleType(), True),
+                StructField("quote", StringType(), True),
+                StructField("model_version", StringType(), True),
+                StructField("analyzed_at", TimestampType(), True),
+                StructField("date_partition", StringType(), True),
+            ])
+            
+            silver_df = subreddit_df.mapInPandas(
+                lambda iterator: process_batch(iterator, gemini_keys, ref_broadcast),
+                schema=schema,
+            )
+            
+            # Add analysis_id
+            silver_df = silver_df.withColumn(
+                "analysis_id",
+                spark_hash(col("comment_id"), col("brand_name"), col("product_name"), col("aspect"))
+                .cast(StringType()),
+            )
+            
+            # Iterative Write: Append results immediately
+            # This saves progress after each subreddit
+            try:
+                logger.info(f"Writing results for {subreddit} to {sentiment_table}")
+                
+                # Check if table exists to decide between createOrReplace (first time) or append
+                # Actually, we handled creation above (lines 451-473 in original, but I might have cut it? 
+                # No, I am replacing the loop. The table creation block was BEFORE this replacement range.
+                # So table should exist or have been created empty.)
+                
+                # Use append() for iterative addition
+                silver_df.writeTo(sentiment_table).append()
+                logger.info(f"Successfully appended results for {subreddit}")
+                processed_count += subreddit_count
+                
+            except Exception as e:
+                logger.error(f"Failed to write results for {subreddit}: {e}")
+                # We continue to next subreddit instead of failing the whole job immediately?
+                # Or fail? Failing is safer to alert issues.
+                raise e
+                
+        if processed_count == 0:
+            logger.warn("No new results generated from any subreddit.")
+                
+        # 8. Emit metrics
+        end_time = datetime.now(timezone.utc)
+        duration_seconds = (end_time - start_time).total_seconds()
+        
+        metrics_writer.add_metric("CommentsAnalyzedByGemini", float(processed_count), unit='Count')
+        metrics_writer.add_metric("JobDurationSeconds", duration_seconds, unit='Seconds')
+        metrics_writer.publish()
+        
+        logger.info(f"Silver-sentiment job completed successfully in {duration_seconds:.2f} seconds")
+        logger.info(f"Analyzed {processed_count} comments across {len(subreddits)} subreddits")
     
     job.commit()
 
