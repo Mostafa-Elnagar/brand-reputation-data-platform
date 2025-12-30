@@ -54,8 +54,15 @@ We bridge the gap between data engineering and business intelligence using **Sno
 -   **Zero-Copy Integration**: Snowflake reads the Silver Iceberg tables directly from S3 via **Glue Catalog Integration**. There is no "copy into" command; data is available instantly after the Glue job finishes.
 -   **Star Schema Data Mart**:
     -   `fact_brand_mentions`: Central metrics table.
-    -   `dim_product`: Domain-specific dimensions (replacable).
+    -   `dim_submissions`: Contextual Metadata.
+    -   `dim_product`: Domain-specific dimensions (replaceable).
     -   `dim_date`: Time dimension.
+
+### The Grain
+**One row per Sentiment Aspect.**
+*   *Example*: "Great camera, bad battery" = 2 Rows (1 Positive Camera, 1 Negative Battery).
+
+<img width="1183" height="837" alt="BrandRep" src="https://github.com/user-attachments/assets/2a51cd24-b010-4b64-b816-7d0a6dde8eda" />
 
 ---
 
