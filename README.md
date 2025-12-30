@@ -1,119 +1,102 @@
 # Market Opinion Data Platform
 
-**Turn Social Chatter into Competitive Advantage.**
+**A Generic, Enterprise-Grade Batch Data Pipeline for Market Intelligence.**
 
-An enterprise-grade data intelligence platform that transforms millions of unstructured Reddit discussions into actionable market insights. Built for smartphone brands, product managers, and market researchers who need to understand the "why" behind customer sentiment.
+This platform is a scalable, serverless data lakehouse framework designed to ingest, transform, and analyze unstructured social media data at scale. It demonstrates a production-ready **Batch Processing** architecture using AWS and Snowflake.
+
+> **Showcase Implementation**: This repository contains a reference implementation for **Smartphone Market Intelligence**, allowing brands to track sentiment across features like *Camera*, *Battery*, and *Price*. However, the core engine is domain-agnostic and can be adapted for Automotive, Gaming, Finance, or any other vertical.
 
 ![Architecture](assets/architecture.jpg)
 
 ---
 
-## 🚀 Business Value
+## 🏗️ Core Architecture:
 
-In the hyper-competitive smartphone market, understanding customer sentiment in real-time is the difference between leading the market and playing catch-up.
+The platform is designed as a robust **Batch Processing Pipeline**, ensuring data consistency, lineage, and auditability. It is **not** a streaming system; it operates on scheduled intervals (e.g., hourly, daily) to process massive datasets efficiently and cost-effectively.
 
-### 🎯 Competitive Intelligence
-- **Benchmarking**: Compare your brand's reputation directly against competitors (e.g., Samsung vs. Apple vs. Google) in real-time.
-- **Trend Detection**: Spot emerging user complaints or viral features before they hit mainstream tech news.
-
-### 💡 Product Development Insights
-- **Feature-Level Granularity**: Don't just know *if* users like a phone—know *what* they like. Our AI breaks down sentiment by feature: **Camera**, **Battery**, **Display**, **Performance**, **Price**, and **Software**.
-- **Authentic Feedback**: Tap into unfiltered, authentic discussions from power users and enthusiasts on Reddit, avoiding the bias of traditional surveys.
-
-### 📊 Market Research at Scale
-- **Data-Driven Decisions**: Replace "gut feeling" with hard data backed by thousands of user discussions.
-- **Historical Analysis**: Track how sentiment shifts over time after software updates or new product launches.
+### The Pipeline Flow
+1.  **Scheduled Ingestion (EventBridge & Step Functions)**: Triggers the workflow on a defined schedule.
+2.  **Partitioned Lakehouse (Iceberg)**: Data is stored in S3 time-partitioned (`date=DD-MM-YYYY`), enabling efficient backfills and temporal queries.
+3.  **State Management (DynamoDB)**: Tracks checkpoints and run metadata, ensuring no data is missed or duplicated between batches.
+4.  **Transformation (Glue/Spark)**: Heavy-lifting ETL jobs process entire partitions at once.
 
 ---
 
-## 🏗️ Architecture & Technology
+## 🚀 Key Features
 
-Built on a robust **Event-Driven, Serverless Architecture**, this platform is designed for scale, reliability, and cost-efficiency.
+### 1. Generic Ingestion Engine
+The ingestion layer is decoupled from the business logic.
+-   **Configurable Sources**: The Lambda-based ingestor fetches data based on configuration (Subreddits, Time Filters), not hardcoded rules.
+-   **Raw Data Preservation**: All data is landed in a raw `Bronze` layer (S3), ensuring you can re-process history with new models later.
 
-### The "Medallion" Data Lakehouse
-We use a multi-layer **Apache Iceberg** architecture to ensure data quality and lineage:
+### 2. Pluggable Sentiment Analysis (The "Brain")
+The logic for taking raw text and extracting value is modular.
+-   **Showcase Module**: `modules/sentiment_analysis` contains the reference logic for Smartphones (Prompt Engineering for "Camera", "Battery", etc.).
+-   **Adaptability**: By swapping the *Reference Data* (CSV) and the *Prompt Builder*, this same pipeline can analyze:
+    -   **Cars**: (Engine, Comfort, Safety)
+    -   **Games**: (Graphics, Gameplay, Story)
+    -   **Hotels**: (Cleanliness, Service, Location)
 
-1.  **Landing Zone (S3)**: Raw JSON data ingestion from Reddit.
-2.  **Bronze Layer**: Deduplicated, raw tables ensuring a complete history.
-3.  **Silver Core**: Cleaned, standardized data ready for analysis.
-4.  **Silver Sentiment (AI)**: Enriched data with **Google Gemini Flash** AI sentiment scores.
-5.  **Gold Layer (Snowflake)**: Analytics-ready data marts for business intelligence dashboards.
+### 3. "Medallion" Data Lakehouse
+We use a multi-layer **Apache Iceberg** architecture to ensure data quality:
+1.  **Landing Zone**: Raw JSONL from API.
+2.  **Bronze**: Deduplicated, raw history.
+3.  **Silver Core**: Cleaned, standardized data.
+4.  **Silver Sentiment**: Enriched data with AI scores.
+5.  **Gold (Snowflake)**: Business-ready Data Mart.
 
-### ❄️ Snowflake Analytics Layer
-We bridge the gap between data engineering and business intelligence using **Snowflake**.
+---
 
--   **Zero-Copy Integration**: Snowflake directly reads the Silver Iceberg tables from S3 using a **Glue Catalog Integration**, eliminating redundant data copies.
+## ❄️ Gold Layer: Snowflake Integration
+
+We bridge the gap between data engineering and business intelligence using **Snowflake** as the consumption layer.
+
+-   **Zero-Copy Integration**: Snowflake reads the Silver Iceberg tables directly from S3 via **Glue Catalog Integration**. There is no "copy into" command; data is available instantly after the Glue job finishes.
 -   **Star Schema Data Mart**:
-    -   `fact_brand_mentions`: The central metric table linking sentiment scores to products and time.
-    -   `dim_product`: Rich product specifications (982+ models).
-    -   `dim_date`: Time dimension for trend analysis.
-
-### Key Technologies
--   **Compute**: AWS Lambda (serverless ingestion), AWS Glue (Spark-based ETL).
--   **Orchestration**: AWS Step Functions & EventBridge.
--   **AI/ML**: Google Gemini 1.5 Flash for high-speed, cost-effective aspect-based sentiment analysis.
--   **Storage**: Amazon S3 & DynamoDB.
--   **IaC**: Fully automated deployment with **Terraform**.
+    -   `fact_brand_mentions`: Central metrics table.
+    -   `dim_product`: Domain-specific dimensions (replacable).
+    -   `dim_date`: Time dimension.
 
 ---
 
 ## ⚡ Quick Start
 
-Follow these steps to deploy the platform in your own AWS environment.
-
 ### Prerequisites
--   **AWS Account** with Admin permissions.
--   **Terraform** (v1.0+) and **AWS CLI** installed.
--   **Reddit API Credentials** (Client ID, Secret).
--   **Google Gemini API Key**.
+-   **AWS Account** (Admin permissions)
+-   **Terraform** (v1.0+) & **AWS CLI**
+-   **Snowflake Account** (Optional, for Gold layer)
 
 ### 1. Build & Package
-The platform uses Python-based Lambda functions and Glue scripts. You must build the dependencies first.
+The pipeline uses Python-based Lambda functions and Glue scripts.
 
 ```bash
-# Clone the repository
-git clone <repository-url>
-cd market-opinion-data-platform
-
-# 1. Build the Ingestion Lambda
+# 1. Build the Generic Ingestion Lambda
 ./scripts/build_lambda.sh
 
-# 2. Build the Sentiment Analysis Library for AWS Glue
+# 2. Build the Domain-Specific Sentiment Library
+# (This packages the 'modules/sentiment_analysis' logic)
 ./scripts/build_glue_libs.sh
 ```
 
-### 2. Configure Credentials
-Store your sensitive API keys in AWS Secrets Manager:
+### 2. Deploy Infrastructure
+Deploy the Terraform layers in order.
 
 ```bash
-aws secretsmanager create-secret \
-  --name reddit_api \
-  --secret-string '{"REDDIT_CLIENT_ID":"your-id","REDDIT_CLIENT_SECRET":"your-secret","REDDIT_USER_AGENT":"your-app"}'
-```
-
-### 3. Deploy Infrastructure
-Deploy the Terraform layers in order. Update `aws/prod.tfvars` with your specifics first.
-
-```bash
-# Deploy S3 Buckets
+# Deploy S3 (Storage)
 cd aws/us-east-1/10_s3 && terraform init && terraform apply -var-file=../../prod.tfvars
 
-# Deploy Database Tables
+# Deploy Observability (DynamoDB)
 cd ../11_dynamodb && terraform init && terraform apply -var-file=../../prod.tfvars
 
-# Deploy Ingestion Lambda
+# Deploy Ingestion Engine
 cd ../20_lambda && terraform init && terraform apply -var-file=../../prod.tfvars
 
-# Deploy Glue Jobs (Bronze)
+# Deploy ETL Jobs (Bronze & Silver)
 cd ../21_glue && terraform init && terraform apply -var-file=../../prod.tfvars
-
-# Deploy Enrichment Jobs (Silver - Sentiment Analysis)
 cd ../22_glue_enrichment && terraform init && terraform apply -var-file=../../prod.tfvars
 
-# Deploy Workflow Orchestration
+# Deploy Orchestration (Step Functions & EventBridge)
 cd ../30_stepfunction && terraform init && terraform apply -var-file=../../prod.tfvars
-
-# Enable Scheduling
 cd ../40_eventbridge && terraform init && terraform apply -var-file=../../prod.tfvars
 ```
 
@@ -121,21 +104,19 @@ cd ../40_eventbridge && terraform init && terraform apply -var-file=../../prod.t
 
 ## 📈 Observability & Monitoring
 
-We believe in "Production-Grade" engineering. The platform comes with built-in observability:
-
--   **Dashboard**: Track ingestion rates, API usage, and system health.
--   **Alerts**: Receive notifications for failed ingestion runs or API rate limits.
--   **Logs**: Centralized CloudWatch logs for deep-dive debugging.
+We believe in "Production-Grade" engineering.
+-   **Batch Metrics**: Every batch run records its volume, duration, and data quality stats (e.g., "Usable Comment Ratio") to DynamoDB.
+-   **Alerting**: Step Functions handles retries and failure notifications.
 
 ---
 
 ## 📜 Repository Structure
 
--   `aws/`: Terraform infrastructure code, organized by layers.
--   `lambda/`: Source code for the Reddit Ingestion Lambda.
--   `modules/`: Shared Python libraries (Reddit client, Sentiment Analysis logic).
--   `scripts/`: Build and utility scripts.
--   `snowflake_models/`: SQL models for the downstream Analytics layer.
+-   `aws/`: Terraform infrastructure code.
+-   `lambda/`: **Generic** Ingestion Engine.
+-   `modules/reddit_ingest/`: **Generic** Reddit API logic.
+-   `modules/sentiment_analysis/`: **Domain-Specific** AI logic (Currently: Smartphones).
+-   `snowflake_models/`: **Domain-Specific** SQL models.
 
 ---
 
