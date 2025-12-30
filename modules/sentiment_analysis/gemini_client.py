@@ -1,6 +1,7 @@
 import logging
 import time
 import threading
+import asyncio
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from typing import Optional, List
@@ -10,7 +11,7 @@ logger = logging.getLogger(__name__)
 class GeminiClient:
     """Client for interacting with Google's Gemini API with multi-key support."""
 
-    def __init__(self, api_keys: List[str], model_name: str = "gemini-2.5-flash"):
+    def __init__(self, api_keys: List[str], model_name: str = "gemma-3-12b-it"):
         """
         Initialize Gemini client with multiple API keys for load distribution.
         
@@ -39,84 +40,40 @@ class GeminiClient:
         
         logger.info(f"GeminiClient initialized with {self.key_count} API keys")
 
-    def _get_next_key(self) -> str:
-        """Get next API key using round-robin rotation (thread-safe)."""
+    def _get_next_key(self) -> tuple[str, int]:
+        """Get next API key and its index using round-robin rotation (thread-safe)."""
         with self._lock:
-            key = self.api_keys[self._current_key_index]
+            index = self._current_key_index
+            key = self.api_keys[index]
             self._current_key_index = (self._current_key_index + 1) % self.key_count
-            return key
-
-    def analyze_sentiment(self, prompt: str, system_prompt: Optional[str] = None) -> Optional[str]:
-        """
-        Sends a prompt to Gemini and returns the text response (Synchronous).
-        """
-        # ... (existing sync implementation wrapped or kept for backward compatibility)
-        # For simplicity, we'll keep the sync implementation as is for now
-        # or we could make it call the async one via asyncio.run() if we wanted to unify logic
-        
-        max_retries = 3
-        full_prompt = prompt
-        if system_prompt:
-            full_prompt = f"{system_prompt}\n\n{prompt}"
-
-        for attempt in range(max_retries):
-            try:
-                api_key = self._get_next_key()
-                genai.configure(api_key=api_key)
-                model = genai.GenerativeModel(self.model_name)
-                
-                response = model.generate_content(
-                    full_prompt,
-                    generation_config={"response_mime_type": "application/json"},
-                    safety_settings=self.safety_settings
-                )
-                return response.text
-                
-            except Exception as e:
-                error_msg = str(e).lower()
-                if 'rate' in error_msg or 'quota' in error_msg or '429' in error_msg:
-                    logger.warning(f"Rate limit hit on key {self._current_key_index}, rotating...")
-                    self._get_next_key()
-                
-                wait_time = 2 ** attempt
-                logger.warning(f"Gemini API call failed (attempt {attempt+1}/{max_retries}): {e}. Retrying in {wait_time}s...")
-                time.sleep(wait_time)
-        
-        logger.error("Max retries reached for Gemini API call.")
-        return None
+            return key, index
 
     async def analyze_sentiment_async(self, prompt: str, system_prompt: Optional[str] = None) -> Optional[str]:
         """
         Sends a prompt to Gemini and returns the text response (Asynchronous).
         Rotates through available API keys and retries on transient errors.
         """
-        import asyncio
-        
-        max_retries = 3
+        max_retries = 3  # Reverted to 3 as requested
         full_prompt = prompt
         if system_prompt:
             full_prompt = f"{system_prompt}\n\n{prompt}"
 
+        import random
+        
         for attempt in range(max_retries):
+            key_index = -1
             try:
                 # Get next API key
-                api_key = self._get_next_key()
+                api_key, key_index = self._get_next_key()
                 
                 # Configure model
-                # Note: genai.configure is global, which might be tricky in async if threads share it.
-                # However, creating a client instance per key or passing api_key to GenerativeModel (if supported) is safer.
-                # The current SDK allows passing api_key to configure.
-                # Ideally, we should lock the configuration step or use separate client objects if the SDK supports it.
-                # For now, we'll assume standard usage but be aware of potential race conditions if multiple threads configure global state.
-                # BUT, since we are using asyncio (single thread), global state changes are sequential between awaits.
-                
                 genai.configure(api_key=api_key)
                 model = genai.GenerativeModel(self.model_name)
                 
                 # Async generation
+                # Note: gemma-3-27b-it does not support response_mime_type="application/json"
                 response = await model.generate_content_async(
                     full_prompt,
-                    generation_config={"response_mime_type": "application/json"},
                     safety_settings=self.safety_settings
                 )
                 return response.text
@@ -124,12 +81,26 @@ class GeminiClient:
             except Exception as e:
                 error_msg = str(e).lower()
                 
+                # Handle Rate Limits
                 if 'rate' in error_msg or 'quota' in error_msg or '429' in error_msg:
-                    logger.warning(f"Rate limit hit (Async), rotating key...")
-                    self._get_next_key()
+                    logger.warning(f"Rate limit hit on key index {key_index}, rotating key...")
+                    
+                    # Check for explicit retry delay in error message
+                    import re
+                    match = re.search(r'retry in (\d+(\.\d+)?)s', error_msg)
+                    if match:
+                        wait_time = float(match.group(1)) + 1 + random.uniform(0, 1) # Add buffer + jitter
+                        logger.warning(f"Quota exceeded. Waiting {wait_time:.2f}s as requested by API...")
+                        await asyncio.sleep(wait_time)
+                        continue 
+
+                # Exponential backoff with jitter: 2, 4, 8, 16... + random
+                base_delay = 2
+                wait_time = (base_delay * (2 ** attempt)) + random.uniform(0, 1)
+                # Cap max wait time to 60s
+                wait_time = min(wait_time, 60.0)
                 
-                wait_time = 2 ** attempt
-                logger.warning(f"Gemini Async API call failed (attempt {attempt+1}/{max_retries}): {e}. Retrying in {wait_time}s...")
+                logger.warning(f"Gemini Async API call failed (attempt {attempt+1}/{max_retries}) with key index {key_index}: {e}. Retrying in {wait_time:.2f}s...")
                 await asyncio.sleep(wait_time)
         
         logger.error("Max retries reached for Gemini Async API call.")
