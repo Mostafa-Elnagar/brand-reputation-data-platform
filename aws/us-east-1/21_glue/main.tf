@@ -66,250 +66,16 @@ resource "aws_glue_catalog_database" "bronze" {
   tags = local.default_tags
 }
 
-# =============================================================================
-# Bronze Submissions Table (Iceberg)
-# =============================================================================
-
-resource "aws_glue_catalog_table" "submissions_bronze" {
-  name          = "submissions"
-  database_name = aws_glue_catalog_database.bronze.name
-
-  table_type = "EXTERNAL_TABLE"
-
-  parameters = {
-    "format"            = "parquet"
-    "write_compression" = "zstd"
-    "classification"    = "parquet"
-  }
-
-  open_table_format_input {
-    iceberg_input {
-      metadata_operation = "CREATE"
-      version            = "2"
-    }
-  }
-
-  storage_descriptor {
-    location = local.bronze_submissions_path
-
-    columns {
-      name = "id"
-      type = "string"
-    }
-    columns {
-      name = "fullname_id"
-      type = "string"
-    }
-    columns {
-      name = "subreddit"
-      type = "string"
-    }
-    columns {
-      name = "author"
-      type = "string"
-    }
-    columns {
-      name = "title"
-      type = "string"
-    }
-    columns {
-      name = "selftext"
-      type = "string"
-    }
-    columns {
-      name = "created_utc"
-      type = "bigint"
-    }
-    columns {
-      name = "updated_at"
-      type = "bigint"
-    }
-    columns {
-      name = "score"
-      type = "int"
-    }
-    columns {
-      name = "upvote_ratio"
-      type = "double"
-    }
-    columns {
-      name = "num_comments"
-      type = "int"
-    }
-    columns {
-      name = "is_self"
-      type = "boolean"
-    }
-    columns {
-      name = "stickied"
-      type = "boolean"
-    }
-    columns {
-      name = "locked"
-      type = "boolean"
-    }
-    columns {
-      name = "distinguished"
-      type = "string"
-    }
-    columns {
-      name = "permalink"
-      type = "string"
-    }
-    columns {
-      name = "url"
-      type = "string"
-    }
-    columns {
-      name = "edited"
-      type = "bigint"
-    }
-    columns {
-      name = "is_video"
-      type = "boolean"
-    }
-    columns {
-      name = "media_only"
-      type = "boolean"
-    }
-    columns {
-      name = "thumbnail"
-      type = "string"
-    }
-    columns {
-      name = "ingestion_timestamp"
-      type = "timestamp"
-    }
-    columns {
-      name = "source_sort_type"
-      type = "string"
-    }
-    columns {
-      name = "source_file"
-      type = "string"
-    }
-    columns {
-      name = "partition_date"
-      type = "string"
-    }
-  }
-}
-
-# =============================================================================
-# Bronze Comments Table (Iceberg)
-# =============================================================================
-
-resource "aws_glue_catalog_table" "comments_bronze" {
-  name          = "comments"
-  database_name = aws_glue_catalog_database.bronze.name
-
-  table_type = "EXTERNAL_TABLE"
-
-  parameters = {
-    "format"            = "parquet"
-    "write_compression" = "zstd"
-    "classification"    = "parquet"
-  }
-
-  open_table_format_input {
-    iceberg_input {
-      metadata_operation = "CREATE"
-      version            = "2"
-    }
-  }
-
-  storage_descriptor {
-    location = local.bronze_comments_path
-
-    columns {
-      name = "id"
-      type = "string"
-    }
-    columns {
-      name = "fullname_id"
-      type = "string"
-    }
-    columns {
-      name = "submission_id"
-      type = "string"
-    }
-    columns {
-      name = "link_id"
-      type = "string"
-    }
-    columns {
-      name = "parent_id"
-      type = "string"
-    }
-    columns {
-      name = "author"
-      type = "string"
-    }
-    columns {
-      name = "body"
-      type = "string"
-    }
-    columns {
-      name = "created_utc"
-      type = "bigint"
-    }
-    columns {
-      name = "updated_at"
-      type = "bigint"
-    }
-    columns {
-      name = "score"
-      type = "int"
-    }
-    columns {
-      name = "controversiality"
-      type = "int"
-    }
-    columns {
-      name = "is_submitter"
-      type = "boolean"
-    }
-    columns {
-      name = "distinguished"
-      type = "string"
-    }
-    columns {
-      name = "edited"
-      type = "bigint"
-    }
-    columns {
-      name = "permalink"
-      type = "string"
-    }
-    columns {
-      name = "depth"
-      type = "int"
-    }
-    columns {
-      name = "ingestion_timestamp"
-      type = "timestamp"
-    }
-    columns {
-      name = "source_sort_type"
-      type = "string"
-    }
-    columns {
-      name = "source_file"
-      type = "string"
-    }
-    columns {
-      name = "partition_date"
-      type = "string"
-    }
-  }
-}
+# Note: Iceberg tables (submissions, comments) are created by the Glue job
+# to ensure correct metadata initialization. Defining them here causes
+# issues with missing metadata files.
 
 # =============================================================================
 # Glue Script Upload to S3
 # =============================================================================
 
 resource "aws_s3_object" "bronze_ingestion_script" {
-  bucket = local.augmented_bucket_name
+  bucket = local.lakehouse_bucket_name
   key    = "glue/scripts/reddit_bronze_ingestion.py"
   source = "${path.module}/scripts/reddit_bronze_ingestion.py"
   etag   = filemd5("${path.module}/scripts/reddit_bronze_ingestion.py")
@@ -330,7 +96,7 @@ resource "aws_glue_job" "reddit_bronze_ingestion" {
 
   command {
     name            = "glueetl"
-    script_location = "s3://${local.augmented_bucket_name}/${aws_s3_object.bronze_ingestion_script.key}"
+    script_location = "s3://${local.lakehouse_bucket_name}/${aws_s3_object.bronze_ingestion_script.key}"
     python_version  = "3"
   }
 
@@ -340,15 +106,16 @@ resource "aws_glue_job" "reddit_bronze_ingestion" {
     "--enable-metrics"                   = "true"
     "--enable-continuous-cloudwatch-log" = "true"
     "--enable-spark-ui"                  = "true"
-    "--spark-event-logs-path"            = "s3://${local.augmented_bucket_name}/glue/spark-logs/"
-    "--TempDir"                          = "s3://${local.augmented_bucket_name}/glue/temp/"
+    "--spark-event-logs-path"            = "s3://${local.lakehouse_bucket_name}/glue/spark-logs/"
+    "--TempDir"                          = "s3://${local.lakehouse_bucket_name}/glue/temp/"
     "--LANDING_BUCKET"                   = local.landing_bucket_name
     "--DATABASE_NAME"                    = aws_glue_catalog_database.bronze.name
-    "--AUGMENTED_BUCKET"                 = local.augmented_bucket_name
+    "--AUGMENTED_BUCKET"                 = local.lakehouse_bucket_name
     "--METRICS_TABLE_NAME"               = local.glue_metrics_table_name
     "--ENVIRONMENT"                      = var.environment
     "--METRICS_NAMESPACE"                = "RedditBronzeIngestion"
     "--datalake-formats"                 = "iceberg"
+    "--conf"                             = "spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog"
   }
 
   execution_property {

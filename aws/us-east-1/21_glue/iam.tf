@@ -123,8 +123,8 @@ data "aws_iam_policy_document" "glue_job_policy" {
     ]
 
     resources = [
-      local.augmented_bucket_arn,
-      "${local.augmented_bucket_arn}/*",
+      local.lakehouse_bucket_arn,
+      "${local.lakehouse_bucket_arn}/*",
     ]
   }
 

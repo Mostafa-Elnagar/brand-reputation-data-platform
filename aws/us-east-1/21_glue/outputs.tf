@@ -28,12 +28,12 @@ output "bronze_database_name" {
 
 output "submissions_bronze_table_name" {
   description = "Bronze Iceberg table name for Reddit submissions."
-  value       = aws_glue_catalog_table.submissions_bronze.name
+  value       = "submissions"
 }
 
 output "comments_bronze_table_name" {
   description = "Bronze Iceberg table name for Reddit comments."
-  value       = aws_glue_catalog_table.comments_bronze.name
+  value       = "comments"
 }
 
 output "bronze_ingestion_job_name" {
