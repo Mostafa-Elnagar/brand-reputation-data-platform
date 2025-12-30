@@ -383,7 +383,7 @@ resource "aws_glue_job" "reddit_silver_core" {
     "--enable-metrics"                   = "true"
     "--enable-continuous-cloudwatch-log" = "true"
     "--enable-glue-datacatalog"          = "true"
-    "--enable-job-insights"              = "true"
+    "--enable-job-insights"              = "false"
     "--datalake-formats"                 = "iceberg"
     "--conf"                             = "spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
     
@@ -424,7 +424,7 @@ resource "aws_glue_job" "reddit_silver_sentiment" {
     "--enable-metrics"                   = "true"
     "--enable-continuous-cloudwatch-log" = "true"
     "--enable-glue-datacatalog"          = "true"
-    "--enable-job-insights"              = "true"
+    "--enable-job-insights"              = "false"
     "--datalake-formats"                 = "iceberg"
     "--conf"                             = "spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
     "--extra-py-files"                   = "s3://${local.lakehouse_bucket_name}/${aws_s3_object.sentiment_modules.key}"
