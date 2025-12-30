@@ -28,15 +28,14 @@ Usage:
 
 import sys
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict
 
 import boto3
-from awsglue.transforms import *
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
-from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import DataFrame
 from pyspark.sql.functions import (
     col, lit, length, size, split, trim, when,
     count as spark_count, sum as spark_sum
@@ -46,13 +45,27 @@ from pyspark.sql.functions import (
 # Configuration and Logging
 # =============================================================================
 
-args = getResolvedOptions(sys.argv, [
+required_params = [
     'JOB_NAME',
     'LAKEHOUSE_BUCKET',
     'BRONZE_DATABASE',
     'SILVER_DATABASE',
     'ENVIRONMENT',
-])
+]
+
+# Add optional parameters if present in sys.argv
+if any('--PROCESS_DATE' in arg for arg in sys.argv):
+    required_params.append('PROCESS_DATE')
+if any('--MIN_SUBMISSION_LEN_CHARS' in arg for arg in sys.argv):
+    required_params.append('MIN_SUBMISSION_LEN_CHARS')
+if any('--MIN_SUBMISSION_MIN_WORDS' in arg for arg in sys.argv):
+    required_params.append('MIN_SUBMISSION_MIN_WORDS')
+if any('--MIN_COMMENT_LEN_CHARS' in arg for arg in sys.argv):
+    required_params.append('MIN_COMMENT_LEN_CHARS')
+if any('--MIN_COMMENT_MIN_WORDS' in arg for arg in sys.argv):
+    required_params.append('MIN_COMMENT_MIN_WORDS')
+
+args = getResolvedOptions(sys.argv, required_params)
 
 # Optional arguments with defaults
 PROCESS_DATE = args.get('PROCESS_DATE')
@@ -129,6 +142,19 @@ class CloudWatchMetricsWriter:
 CLOUDWATCH_MAX_METRICS_PER_BATCH = 20
 
 # =============================================================================
+# Helper Functions
+# =============================================================================
+
+def count_words_col(col_name: str):
+    """Helper to count words in a column, handling empty strings."""
+    return when(
+        trim(col(col_name)) == "",
+        lit(0)
+    ).otherwise(
+        size(split(trim(col(col_name)), r"\s+"))
+    )
+
+# =============================================================================
 # Silver-core Cleaning Functions
 # =============================================================================
 
@@ -158,15 +184,6 @@ def clean_submissions(bronze_df: DataFrame) -> DataFrame:
         col("partition_date")
     )
     
-    # Helper: count words in a column, handling empty strings
-    def word_count(text_col):
-        return when(
-            trim(text_col) == "",
-            lit(0)
-        ).otherwise(
-            size(split(trim(text_col), r"\s+"))
-        )
-    
     # Compute is_usable_for_sentiment flag
     # Unusable if:
     # 1. selftext is deleted/removed/empty
@@ -182,7 +199,7 @@ def clean_submissions(bronze_df: DataFrame) -> DataFrame:
             lit(False)
         ).when(
             # Check combined word count (with proper empty string handling)
-            (word_count(col("title")) + word_count(col("selftext"))) < MIN_SUBMISSION_MIN_WORDS,
+            (count_words_col("title") + count_words_col("selftext")) < MIN_SUBMISSION_MIN_WORDS,
             lit(False)
         ).otherwise(lit(True))
     )
@@ -231,15 +248,6 @@ def clean_comments(bronze_df: DataFrame, submissions_df: DataFrame) -> DataFrame
         submissions_minimal["subreddit"]
     )
     
-    # Helper: count words in a column, handling empty strings
-    def word_count(text_col):
-        return when(
-            trim(text_col) == "",
-            lit(0)
-        ).otherwise(
-            size(split(trim(text_col), r"\s+"))
-        )
-    
     # Compute is_usable_for_sentiment flag
     # Unusable if:
     # 1. body is deleted/removed/empty
@@ -254,7 +262,7 @@ def clean_comments(bronze_df: DataFrame, submissions_df: DataFrame) -> DataFrame
             lit(False)
         ).when(
             # Check word count with proper empty string handling
-            word_count(col("body")) < MIN_COMMENT_MIN_WORDS,
+            count_words_col("body") < MIN_COMMENT_MIN_WORDS,
             lit(False)
         ).otherwise(lit(True))
     )
@@ -348,59 +356,77 @@ try:
     bronze_com_count = bronze_comments.count()
     
     if bronze_sub_count == 0 and bronze_com_count == 0:
-        logger.warning(f"No data found for PROCESS_DATE = {PROCESS_DATE}. Skipping processing.")
-        job.commit()
-        spark.stop()
-        sys.exit(0)
-    
-    logger.info(f"Processing {bronze_sub_count} submissions and {bronze_com_count} comments from Bronze")
+        if PROCESS_DATE:
+            logger.warn(f"No data found for PROCESS_DATE = {PROCESS_DATE}. Skipping processing.")
+        else:
+            logger.warn("No data found in Bronze layer. Skipping processing.")
+    else:
+        logger.info(f"Processing {bronze_sub_count} submissions and {bronze_com_count} comments from Bronze")
 
-    # Process submissions
-    silver_submissions = clean_submissions(bronze_submissions)
-    
-    # Process comments (pass submissions for subreddit join)
-    silver_comments = clean_comments(bronze_comments, bronze_submissions)
-    
-    # Compute metrics before writing
-    metrics = compute_metrics(silver_submissions, silver_comments)
-    for metric_name, value in metrics.items():
-        metrics_writer.add_metric(metric_name, value)
-    
-    # Write to Silver-core Iceberg tables
-    # Use createOrReplace() to ensure table is created/updated correctly.
-    # IMPORTANT: Data must be sorted by partition key to avoid "records violate writer assumption" error.
-    silver_submissions_table = f"glue_catalog.{args['SILVER_DATABASE']}.submissions_silver"
-    silver_comments_table = f"glue_catalog.{args['SILVER_DATABASE']}.comments_silver"
+        # Process submissions
+        silver_submissions = clean_submissions(bronze_submissions)
+        
+        # Process comments (pass submissions for subreddit join)
+        silver_comments = clean_comments(bronze_comments, bronze_submissions)
+        
+        # Compute metrics before writing
+        metrics = compute_metrics(silver_submissions, silver_comments)
+        for metric_name, value in metrics.items():
+            metrics_writer.add_metric(metric_name, value)
+        
+        # Write to Silver-core Iceberg tables
+        # Use overwritePartitions() for idempotent, incremental updates.
+        # This replaces data ONLY for the partitions present in the source DataFrame.
+        silver_submissions_table = f"glue_catalog.{args['SILVER_DATABASE']}.submissions_silver"
+        silver_comments_table = f"glue_catalog.{args['SILVER_DATABASE']}.comments_silver"
 
-    logger.info(f"Writing submissions to {silver_submissions_table}")
-    silver_submissions.sort("partition_date").writeTo(silver_submissions_table) \
-        .using("iceberg") \
-        .tableProperty("write.format.default", "parquet") \
-        .tableProperty("write.parquet.compression-codec", "zstd") \
-        .partitionedBy("partition_date") \
-        .createOrReplace()
-    
-    logger.info(f"Writing comments to {silver_comments_table}")
-    silver_comments.sort("partition_date").writeTo(silver_comments_table) \
-        .using("iceberg") \
-        .tableProperty("write.format.default", "parquet") \
-        .tableProperty("write.parquet.compression-codec", "zstd") \
-        .partitionedBy("partition_date") \
-        .createOrReplace()
-    
-    # Publish metrics
-    end_time = datetime.now(timezone.utc)
-    duration_seconds = (end_time - start_time).total_seconds()
-    metrics_writer.add_metric("JobDurationSeconds", duration_seconds, unit='Seconds')
-    metrics_writer.publish()
-    
-    logger.info(f"Silver-core cleaning job completed successfully in {duration_seconds:.2f} seconds")
-    logger.info(f"Submissions: {metrics['SubmissionsTotal']} total, "
-                f"{metrics['SubmissionsUsableForSentiment']} usable "
-                f"({metrics['SubmissionsUsableRatio']:.1%})")
-    logger.info(f"Comments: {metrics['CommentsTotal']} total, "
-                f"{metrics['CommentsUsableForSentiment']} usable "
-                f"({metrics['CommentsUsableRatio']:.1%})")
+        logger.info(f"Writing submissions to {silver_submissions_table}")
+        # Ensure table exists before writing (create if not exists)
+        try:
+            spark.sql(f"SELECT 1 FROM {silver_submissions_table} LIMIT 1")
+        except Exception:
+            logger.info(f"Table {silver_submissions_table} does not exist. Creating it.")
+            silver_submissions.sort("partition_date").writeTo(silver_submissions_table) \
+                .using("iceberg") \
+                .tableProperty("write.format.default", "parquet") \
+                .tableProperty("write.parquet.compression-codec", "zstd") \
+                .partitionedBy("partition_date") \
+                .createOrReplace()
+        else:
+            # Table exists, use overwritePartitions
+            silver_submissions.sort("partition_date").writeTo(silver_submissions_table) \
+                .overwritePartitions()
+        
+        logger.info(f"Writing comments to {silver_comments_table}")
+        # Ensure table exists before writing
+        try:
+            spark.sql(f"SELECT 1 FROM {silver_comments_table} LIMIT 1")
+        except Exception:
+            logger.info(f"Table {silver_comments_table} does not exist. Creating it.")
+            silver_comments.sort("partition_date").writeTo(silver_comments_table) \
+                .using("iceberg") \
+                .tableProperty("write.format.default", "parquet") \
+                .tableProperty("write.parquet.compression-codec", "zstd") \
+                .partitionedBy("partition_date") \
+                .createOrReplace()
+        else:
+            # Table exists, use overwritePartitions
+            silver_comments.sort("partition_date").writeTo(silver_comments_table) \
+                .overwritePartitions()
+        
+        # Publish metrics
+        end_time = datetime.now(timezone.utc)
+        duration_seconds = (end_time - start_time).total_seconds()
+        metrics_writer.add_metric("JobDurationSeconds", duration_seconds, unit='Seconds')
+        metrics_writer.publish()
+        
+        logger.info(f"Silver-core cleaning job completed successfully in {duration_seconds:.2f} seconds")
+        logger.info(f"Submissions: {metrics['SubmissionsTotal']} total, "
+                    f"{metrics['SubmissionsUsableForSentiment']} usable "
+                    f"({metrics['SubmissionsUsableRatio']:.1%})")
+        logger.info(f"Comments: {metrics['CommentsTotal']} total, "
+                    f"{metrics['CommentsUsableForSentiment']} usable "
+                    f"({metrics['CommentsUsableRatio']:.1%})")
 
 except Exception as e:
     logger.error(f"Job failed with error: {str(e)}")
@@ -409,4 +435,3 @@ except Exception as e:
 finally:
     job.commit()
     spark.stop()
-
