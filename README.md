@@ -11,7 +11,7 @@ The current scope focuses on **Reddit ingestion into the landing and bronze laye
 - Run metadata and checkpoints stored in DynamoDB, plus metrics in CloudWatch.
 
 ---
-![Architecture](https://github.com/user-attachments/assets/49293c1c-d53b-4228-aaa3-a95f9c58a357)
+![Architecture](assets/architecture.png)
 
 ## Repository Structure
 
